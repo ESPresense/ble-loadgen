@@ -21,8 +21,7 @@ the run and the runner kills it at the end — no host service, no gating.
   detach: true
   privileged: true
   network_mode: host          # raw HCI only works in the host netns (see below)
-  commands:
-    - python3 /usr/local/bin/ble_flood.py --index 0 --rate 40
+  # no commands: the image ENTRYPOINT is `python3 ble_flood.py`, CMD supplies --index/--rate
 ```
 
 ## Requirements
