@@ -35,11 +35,32 @@ the run and the runner kills it at the end — no host service, no gating.
 
 ## Usage
 
+The script is pure stdlib — run it directly:
+
 ```bash
 python3 ble_flood.py --selftest              # framing + address rules, no hardware
 sudo python3 ble_flood.py --index 0 --rate 40        # flood until killed
 sudo python3 ble_flood.py --index 0 --seconds 30     # one 30s burst
 ```
+
+### Docker
+
+The image entrypoint is `python3 ble_flood.py`, so arguments go straight after the image.
+Flooding needs the host network namespace (raw HCI) and `CAP_NET_ADMIN`:
+
+```bash
+# flood until stopped — default args are --index 0 --rate 40
+docker run --rm --network host --privileged ghcr.io/espresense/ble-loadgen:1
+
+# one 30s burst on hci0
+docker run --rm --network host --privileged ghcr.io/espresense/ble-loadgen:1 --seconds 30
+
+# selftest needs neither host net nor privileged (it touches no socket)
+docker run --rm ghcr.io/espresense/ble-loadgen:1 --selftest
+```
+
+`--cap-add NET_ADMIN` in place of `--privileged` also works; `--privileged` is what the HIL
+pipeline already grants, so the docs use it for parity.
 
 ## Why static random addresses with the MAC in the name
 
