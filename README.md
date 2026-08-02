@@ -33,6 +33,12 @@ the run and the runner kills it at the end — no host service, no gating.
 - **BlueZ absent.** `HCI_CHANNEL_USER` takes exclusive control of a *down* adapter;
   `bluetoothd` would fight for it. Don't install it, or mask it.
 
+On `EBUSY` the flood retries for 30s before giving up — busy is usually transient. If it
+still fails, something is holding the adapter: `bluetoothd`
+(`systemctl mask --now bluetooth`) or a leftover detached ble-flood from a previous HIL run
+(`pkill -f ble_flood.py`). Missing `CAP_NET_ADMIN` or a missing adapter fails immediately
+instead, and the message says which.
+
 ## Usage
 
 The script is pure stdlib — run it directly:
