@@ -51,9 +51,9 @@ ADV_NONCONN_IND = 0x03
 OWN_ADDR_TYPE_RANDOM = 0x01
 ADV_INTERVAL = 0x0020  # 20 ms — the BLE minimum, so a packet lands on all 3 channels
 
-# ponytail: one constant, no --wait flag. A busy adapter is usually transient (bluetoothd
-# re-powering it, or the previous run's flood still exiting); 30s covers both. Make it a CLI
-# flag only if the bench shows a legitimate wait longer than this.
+# A constant rather than a CLI flag: a busy adapter is transient for one of two reasons
+# (bluetoothd re-powering it, or the previous run's flood still exiting) and 30s covers both.
+# Make it a flag if the bench ever shows a legitimate wait longer than this.
 BIND_TIMEOUT = 30.0
 
 
@@ -120,9 +120,11 @@ def _bind_hint(index, down_err, bind_err):
     is on the bench chasing the wrong one.
     """
     what = f"bind(hci{index}, HCI_CHANNEL_USER) failed: {os.strerror(bind_err)}"
-    if down_err == errno_mod.EPERM:
-        return (f"{what}. HCIDEVDOWN was denied (EPERM): this needs CAP_NET_ADMIN — run as "
-                f"root, or the container with --privileged / --cap-add NET_ADMIN.")
+    # Both HCIDEVDOWN and a HCI_CHANNEL_USER bind gate on CAP_NET_ADMIN in the kernel, so
+    # EPERM from either is the same missing capability.
+    if errno_mod.EPERM in (down_err, bind_err):
+        return (f"{what}. Denied (EPERM): this needs CAP_NET_ADMIN — run as root, or the "
+                f"container with --privileged / --cap-add NET_ADMIN.")
     if down_err == errno_mod.ENODEV or bind_err == errno_mod.ENODEV:
         return (f"{what}. No hci{index}: check `ls /sys/class/bluetooth` on the host, and that "
                 f"the container has --network host (raw HCI only works in the host netns).")
@@ -178,9 +180,12 @@ def open_adapter(index):
         retryable = (bind_err == errno_mod.EBUSY
                      and down_err not in (errno_mod.EPERM, errno_mod.ENODEV))
         if not retryable or time.monotonic() >= deadline:
-            raise OSError(bind_err, _bind_hint(index, down_err, bind_err))
+            # Carry the errno that explains the failure, not the one that merely reports it:
+            # anything keying off exc.errno should see EPERM, not the EBUSY it caused.
+            cause = down_err if down_err in (errno_mod.EPERM, errno_mod.ENODEV) else bind_err
+            raise OSError(cause, _bind_hint(index, down_err, bind_err))
         if not announced:
-            print(f"[flood] hci{index} busy, retrying for {BIND_TIMEOUT:.0f}s…", flush=True)
+            print(f"[flood] hci{index} busy, retrying for {BIND_TIMEOUT:.0f}s...", flush=True)
             announced = True
         time.sleep(0.5)
 
@@ -328,6 +333,8 @@ def selftest():
     # The failure message is the whole diagnosis: EBUSY alone never says which cause it is.
     perm = _bind_hint(0, errno_mod.EPERM, errno_mod.EBUSY)
     assert "CAP_NET_ADMIN" in perm and "privileged" in perm, perm
+    # bind() gates on CAP_NET_ADMIN too, so EPERM from it alone must give the same advice.
+    assert "CAP_NET_ADMIN" in _bind_hint(0, None, errno_mod.EPERM)
     nodev = _bind_hint(0, errno_mod.ENODEV, errno_mod.EBUSY)
     assert "network host" in nodev and "sys/class/bluetooth" in nodev, nodev
     assert "network host" in _bind_hint(0, None, errno_mod.ENODEV)
