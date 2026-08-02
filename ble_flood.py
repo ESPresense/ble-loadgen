@@ -22,6 +22,7 @@ run and the runner stops it at the end — no external gating.
 
 import argparse
 import ctypes
+import errno as errno_mod
 import fcntl
 import os
 import secrets
@@ -49,6 +50,11 @@ OCF_LE_SET_ADV_ENABLE = 0x200A
 ADV_NONCONN_IND = 0x03
 OWN_ADDR_TYPE_RANDOM = 0x01
 ADV_INTERVAL = 0x0020  # 20 ms — the BLE minimum, so a packet lands on all 3 channels
+
+# ponytail: one constant, no --wait flag. A busy adapter is usually transient (bluetoothd
+# re-powering it, or the previous run's flood still exiting); 30s covers both. Make it a CLI
+# flag only if the bench shows a legitimate wait longer than this.
+BIND_TIMEOUT = 30.0
 
 
 def hci_command(opcode, params=b""):
@@ -106,19 +112,37 @@ def adv_parameters():
     )
 
 
-def open_adapter(index):
-    """Take exclusive raw control of hciN.
+def _bind_hint(index, down_err, bind_err):
+    """What actually went wrong, given how HCIDEVDOWN and bind() each failed.
 
-    The kernel only allows HCI_CHANNEL_USER on a *down* adapter, which is also what
-    guarantees exclusivity: if this succeeds, nothing else is driving the controller.
+    The ioctl's errno is the only thing that separates the causes: EBUSY on bind alone says
+    "the adapter is up", not *why*. Guessing at all three (the old message did) sends whoever
+    is on the bench chasing the wrong one.
     """
+    what = f"bind(hci{index}, HCI_CHANNEL_USER) failed: {os.strerror(bind_err)}"
+    if down_err == errno_mod.EPERM:
+        return (f"{what}. HCIDEVDOWN was denied (EPERM): this needs CAP_NET_ADMIN — run as "
+                f"root, or the container with --privileged / --cap-add NET_ADMIN.")
+    if down_err == errno_mod.ENODEV or bind_err == errno_mod.ENODEV:
+        return (f"{what}. No hci{index}: check `ls /sys/class/bluetooth` on the host, and that "
+                f"the container has --network host (raw HCI only works in the host netns).")
+    if bind_err == errno_mod.EBUSY:
+        return (f"{what} after {BIND_TIMEOUT:.0f}s of retries. Something keeps hci{index} up: "
+                f"bluetoothd (systemctl mask --now bluetooth), or a leftover ble_flood.py from "
+                f"a previous run holding the user channel (pkill -f ble_flood.py).")
+    return what
+
+
+def _try_bind(index):
+    """One down + bind attempt. Returns the socket, or (down_errno, bind_errno) on failure."""
+    down_err = None
     ctl = socket.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
     try:
         fcntl.ioctl(ctl.fileno(), HCIDEVDOWN, index)
-    except OSError:
-        # Already down is the normal case (no bluetoothd). A real problem — missing
-        # adapter, no privileges — surfaces with a clearer message on bind() below.
-        pass
+    except OSError as exc:
+        # Already down is the normal case (no bluetoothd) and reports as EALREADY/success.
+        # Keep the errno regardless: EPERM and ENODEV are the ones worth naming later.
+        down_err = exc.errno
     finally:
         ctl.close()
 
@@ -128,12 +152,37 @@ def open_adapter(index):
     addr = struct.pack("<HHH", AF_BLUETOOTH, index, HCI_CHANNEL_USER)
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     if libc.bind(sock.fileno(), ctypes.c_char_p(addr), len(addr)) != 0:
-        err = ctypes.get_errno()
+        bind_err = ctypes.get_errno()
         sock.close()
-        raise OSError(err, f"bind(hci{index}, HCI_CHANNEL_USER) failed: {os.strerror(err)}. "
-                           f"Is bluetoothd holding the adapter, or is this not root?")
+        return down_err, bind_err
     sock.setblocking(False)
     return sock
+
+
+def open_adapter(index):
+    """Take exclusive raw control of hciN, waiting out a transient EBUSY.
+
+    The kernel only allows HCI_CHANNEL_USER on a *down* adapter, which is also what
+    guarantees exclusivity: if this succeeds, nothing else is driving the controller. It also
+    means EBUSY is a race as often as a real conflict — bluetoothd re-powers the adapter in
+    the gap between the ioctl and the bind — so busy is retried and everything else is not.
+    """
+    deadline = time.monotonic() + BIND_TIMEOUT
+    announced = False
+    while True:
+        result = _try_bind(index)
+        if not isinstance(result, tuple):
+            return result
+        down_err, bind_err = result
+
+        retryable = (bind_err == errno_mod.EBUSY
+                     and down_err not in (errno_mod.EPERM, errno_mod.ENODEV))
+        if not retryable or time.monotonic() >= deadline:
+            raise OSError(bind_err, _bind_hint(index, down_err, bind_err))
+        if not announced:
+            print(f"[flood] hci{index} busy, retrying for {BIND_TIMEOUT:.0f}s…", flush=True)
+            announced = True
+        time.sleep(0.5)
 
 
 class HciError(Exception):
@@ -275,6 +324,16 @@ def selftest():
     assert command_status(other_op, op) is None, "another command's reply must not be claimed"
     assert command_status(adv_report, op) is None, "an advertising report is not a completion"
     assert command_status(b"", op) is None and command_status(b"\x04\x0e", op) is None
+
+    # The failure message is the whole diagnosis: EBUSY alone never says which cause it is.
+    perm = _bind_hint(0, errno_mod.EPERM, errno_mod.EBUSY)
+    assert "CAP_NET_ADMIN" in perm and "privileged" in perm, perm
+    nodev = _bind_hint(0, errno_mod.ENODEV, errno_mod.EBUSY)
+    assert "network host" in nodev and "sys/class/bluetooth" in nodev, nodev
+    assert "network host" in _bind_hint(0, None, errno_mod.ENODEV)
+    busy = _bind_hint(0, None, errno_mod.EBUSY)
+    assert "bluetoothd" in busy and "ble_flood.py" in busy, busy
+    assert "CAP_NET_ADMIN" not in busy, busy
 
     print("selftest OK")
 
