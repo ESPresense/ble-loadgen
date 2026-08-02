@@ -27,6 +27,7 @@ import fcntl
 import os
 import secrets
 import select
+import signal
 import socket
 import struct
 import time
@@ -359,12 +360,20 @@ def main():
     if args.rate <= 0:
         p.error("--rate must be positive")
 
+    # The HIL runs this as a detached step, so it's PID 1 in its container and the runner stops
+    # it with SIGTERM (docker stop). The kernel ignores un-handled signals for PID 1, so without
+    # this the flood outlives the run, keeps hci0, and the next run's bind() fails EBUSY (and its
+    # node sees a flood it never asked for). Route SIGTERM through the same KeyboardInterrupt path
+    # that disables advertising and releases the adapter cleanly.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+
     sock = open_adapter(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
     try:
         flood(sock, args.rate, args.seconds)
     except KeyboardInterrupt:
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
+        print("[flood] stopped on signal", flush=True)
     finally:
         sock.close()
 
