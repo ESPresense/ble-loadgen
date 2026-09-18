@@ -24,6 +24,7 @@ import argparse
 import ctypes
 import errno as errno_mod
 import fcntl
+import glob
 import os
 import secrets
 import select
@@ -56,6 +57,24 @@ ADV_INTERVAL = 0x0020  # 20 ms — the BLE minimum, so a packet lands on all 3 c
 # (bluetoothd re-powering it, or the previous run's flood still exiting) and 30s covers both.
 # Make it a flag if the bench ever shows a legitimate wait longer than this.
 BIND_TIMEOUT = 30.0
+
+# The first command after the bind is the fragile one, and the bench proved it: HCI_Reset timed
+# out at 2s there on a controller that crow's never did. A bind hands us a controller the kernel
+# has just opened, so a command sent into that window can be lost, or answered only once a USB
+# part has finished its firmware setup. Idempotent and cheap to repeat, so it gets a longer wait
+# and retries; the per-rotation commands stay strict, because a wedged controller must still be
+# caught there rather than quietly radiating nothing.
+RESET_TIMEOUT = 15.0
+RESET_ATTEMPTS = 3
+RESET_RETRY_DELAY = 1.0
+
+# The HIL runs the flood as a *detached* step, and a detached step cannot fail the pipeline: it
+# can die in its first second and the soak still reports green, having loaded the node with
+# nothing. So the flood publishes liveness to a file that a non-detached guard step reads, and the
+# soak asserts it was still fresh when the run ended. PID 1 in a container, so a file is the only
+# channel that crosses the step boundary.
+HEARTBEAT_FILENAME = "ble-flood.alive"
+HEARTBEAT_INTERVAL = 30.0
 
 
 def hci_command(opcode, params=b""):
@@ -219,10 +238,14 @@ def send(sock, opcode, params=b"", timeout=2.0):
     """
     sock.sendall(hci_command(opcode, params))
     deadline = time.monotonic() + timeout
+    drained = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise HciError(f"opcode 0x{opcode:04x}: no completion event within {timeout}s")
+            # "Nothing arrived" and "events arrived, just not this reply" are different faults,
+            # and the count is the only thing in a CI log that separates them.
+            saw = f"drained {drained} unrelated events" if drained else "nothing arrived at all"
+            raise HciError(f"opcode 0x{opcode:04x}: no completion event within {timeout}s ({saw})")
         if not select.select([sock], [], [], remaining)[0]:
             continue
         try:
@@ -231,13 +254,122 @@ def send(sock, opcode, params=b"", timeout=2.0):
             continue
         status = command_status(pkt, opcode)
         if status is None:
+            drained += 1
             continue  # an unrelated event (advertising reports etc.) — keep draining
         if status != 0x00:
             raise HciError(f"opcode 0x{opcode:04x} rejected with status 0x{status:02x}")
         return
 
 
-def flood(sock, rate, stop_after):
+def _silent_hint():
+    """What to check when a claimed controller stops answering — the cases a bind cannot explain.
+
+    A successful bind already rules out the usual causes (adapter busy, no CAP_NET_ADMIN, wrong
+    netns), so what is left is controller-level: an rfkill block, an autosuspended USB port, or a
+    dongle left wedged by a flood leaked from a previous run. The rfkill state is read live
+    because it is the one of those that is visible from inside the container.
+    """
+    states = []
+    for path in sorted(glob.glob("/sys/class/bluetooth/hci*/rfkill*/state")):
+        try:
+            with open(path) as fh:
+                states.append(f"{path}={'blocked' if fh.read().strip() == '1' else 'unblocked'}")
+        except OSError:
+            pass
+    return ("The bind succeeded, so hciN is ours and nothing else can be driving it — the "
+            "controller is simply silent. Check `rfkill list` (a soft block leaves it silent), "
+            "that the USB port is not autosuspended, and whether the dongle needs a re-plug; a "
+            "flood leaked by an earlier run wedges it the same way (`pkill -f ble_flood.py`). "
+            f"rfkill: {', '.join(states) if states else 'unreadable'}")
+
+
+def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay=RESET_RETRY_DELAY):
+    """HCI_Reset until the controller answers it.
+
+    Safe to repeat: reset drops whatever state the controller was left in, which is why it is the
+    first command anyway. Retrying is what turns a controller that is still coming up into a
+    working flood instead of a failed HIL step.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            send(sock, OCF_RESET, timeout=timeout)
+        except HciError as exc:
+            last = exc
+            print(f"[flood] HCI_Reset unanswered after {timeout:g}s "
+                  f"(attempt {attempt}/{attempts})", flush=True)
+            if attempt < attempts:
+                time.sleep(delay)
+            continue
+        suffix = "" if attempt == 1 else f" (attempt {attempt})"
+        print(f"[flood] controller answered HCI_Reset in {time.monotonic() - started:.2f}s{suffix}",
+              flush=True)
+        return
+    raise HciError(f"HCI_Reset never completed in {attempts} attempts: {last}. {_silent_hint()}")
+
+
+def write_heartbeat(path, rotations, rate, address):
+    """Publish flood liveness atomically, so a reader never catches a half-written file.
+
+    Failing to write is fatal on purpose: a heartbeat the pipeline cannot read is worse than no
+    heartbeat, because the guard would then fail every run and a mount problem would look like a
+    flood problem.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(f"pid={os.getpid()}\nrotations={rotations}\nrate={rate}\n"
+                     f"last_address={address.hex() if address else ''}\n"
+                     f"updated={time.time():.3f}\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot write flood heartbeat {path}: {exc}") from exc
+
+
+def _read_heartbeat(path):
+    """The parsed heartbeat, or None while it is not there yet."""
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
+    """Fail unless a live flood is refreshing ``path`` — the pipeline's non-detached guard.
+
+    The flood itself cannot fail the build (detached), so the check has to live in a step that
+    can. Waiting for the file catches a flood that never advertised at all; the staleness limit
+    catches one that started and then wedged. Either way the soak has no BLE load, which is worse
+    than a red build: it looks like evidence.
+    """
+    deadline = time.monotonic() + wait
+    while _read_heartbeat(path) is None:
+        if time.monotonic() >= deadline:
+            raise HciError(f"no flood heartbeat at {path} within {wait:g}s: the detached flood "
+                           f"never advertised anything, so this run has no BLE load")
+        time.sleep(poll)
+
+    stop = time.monotonic() + watch
+    while True:
+        fields = _read_heartbeat(path) or {}
+        try:
+            age = time.time() - float(fields["updated"])
+        except (KeyError, ValueError):
+            raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
+        if age > stale:
+            raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s): the "
+                           f"flood stopped after {fields.get('rotations')} rotations")
+        if time.monotonic() >= stop:
+            print(f"[flood] heartbeat OK: {age:.1f}s old, {fields.get('rotations')} rotations",
+                  flush=True)
+            return
+        time.sleep(poll)
+
+
+def flood(sock, rate, stop_after, heartbeat=None):
     """Rotate the advertised address forever (or until time runs out).
 
     Lifetime is the process's: the HIL pipeline runs this as a detached step, so the flood
@@ -246,9 +378,13 @@ def flood(sock, rate, stop_after):
     Order matters: the controller rejects LE Set Random Address while advertising is
     enabled, so each rotation is disable -> re-address -> enable.
     """
-    send(sock, OCF_RESET)
+    reset_controller(sock)
     time.sleep(0.1)
     send(sock, OCF_LE_SET_ADV_PARAMETERS, adv_parameters())
+    # Advertise-ready is the moment the guard cares about: from here the node is being loaded.
+    # Every later refresh only says the flood is still going.
+    if heartbeat:
+        write_heartbeat(heartbeat, 0, rate, b"")
 
     interval = 1.0 / rate
     started = time.monotonic()
@@ -268,9 +404,11 @@ def flood(sock, rate, stop_after):
         rotations += 1
 
         now = time.monotonic()
-        if now - reported >= 30:
+        if now - reported >= HEARTBEAT_INTERVAL:
             print(f"[flood] {rotations} unique addresses in {now - started:.0f}s "
                   f"({rotations / (now - started):.1f}/s)", flush=True)
+            if heartbeat:
+                write_heartbeat(heartbeat, rotations, rate, address)
             reported = now
         time.sleep(max(0.0, interval - (now - cycle)))
 
@@ -343,6 +481,111 @@ def selftest():
     assert "bluetoothd" in busy and "ble_flood.py" in busy, busy
     assert "CAP_NET_ADMIN" not in busy, busy
 
+    # The reset is the one command that must not give up early — the bench timed out on exactly
+    # it while crow never did. Both paths run against a socket-shaped fake, so CI fails if the
+    # retry is ever dropped: retry-then-succeed, and give-up-with-a-reason.
+    import threading
+
+    def fake_socket():
+        """A socket-shaped stand-in. select() needs a real fd, so wrap a socketpair."""
+
+        rd, wr = socket.socketpair()
+
+        class Fake:
+            def __init__(self):
+                self.sent = []
+
+            def fileno(self):
+                return rd.fileno()
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+            def recv(self, n):
+                return rd.recv(n)
+
+            def answer(self, opcode):
+                wr.send(bytes([HCI_EVENT_PKT, EVT_CMD_COMPLETE, 4, 1])
+                        + struct.pack("<H", opcode) + b"\x00")
+
+            def close(self):
+                rd.close()
+                wr.close()
+
+        return Fake()
+
+    # Answer only the second attempt: the first must time out and be retried, not fatal.
+    retrying = fake_socket()
+
+    def answer_on_second():
+        while len(retrying.sent) < 2:
+            time.sleep(0.005)
+        retrying.answer(OCF_RESET)
+
+    threading.Thread(target=answer_on_second, daemon=True).start()
+    reset_controller(retrying, timeout=0.2, attempts=3, delay=0.0)
+    assert len(retrying.sent) == 2, retrying.sent
+    assert all(pkt == hci_command(OCF_RESET) for pkt in retrying.sent), retrying.sent
+    retrying.close()
+
+    # Silence every attempt: it must fail with the attempt count and the cause, not hang.
+    dead = fake_socket()
+    try:
+        reset_controller(dead, timeout=0.05, attempts=3, delay=0.0)
+        raise AssertionError("a silent controller must not look like success")
+    except HciError as exc:
+        assert "3 attempts" in str(exc) and "rfkill" in str(exc), exc
+    assert len(dead.sent) == 3, dead.sent
+    dead.close()
+
+    # A timeout must say what it saw: silence and "events I could not use" differ.
+    quiet = fake_socket()
+    try:
+        send(quiet, OCF_LE_SET_ADV_ENABLE, b"\x01", timeout=0.05)
+        raise AssertionError("an unanswered command must raise")
+    except HciError as exc:
+        assert "nothing arrived at all" in str(exc), exc
+    quiet.close()
+
+    # The guard decides whether a dead flood is allowed to look like a passing run, so all three
+    # outcomes are pinned here: fresh passes, stale fails, absent fails. No hardware involved.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hb = os.path.join(tmpdir, HEARTBEAT_FILENAME)
+        write_heartbeat(hb, 1234, 40.0, bytes.fromhex("aabbccddeeff"))
+        fields = _read_heartbeat(hb)
+        assert fields["rotations"] == "1234" and fields["rate"] == "40.0", fields
+        assert fields["last_address"] == "aabbccddeeff", fields
+        assert abs(time.time() - float(fields["updated"])) < 5, fields
+        # The writer replaces atomically, so a reader must never see the temp file left behind.
+        assert not os.path.exists(f"{hb}.tmp"), "temp file left behind"
+        check_heartbeat(hb, wait=0.05, stale=60, watch=0, poll=0.02)
+
+        # Stale: the flood started and then stopped refreshing — the soak has no load.
+        with open(hb, "w") as fh:
+            fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
+        try:
+            check_heartbeat(hb, wait=0.05, stale=90, watch=0, poll=0.02)
+            raise AssertionError("a stale heartbeat must fail the guard")
+        except HciError as exc:
+            assert "600s old" in str(exc) and "99 rotations" in str(exc), exc
+
+        # Absent: the flood never advertised at all — the bench failure that went unnoticed.
+        try:
+            check_heartbeat(os.path.join(tmpdir, "never-created"), wait=0.05, stale=90,
+                            watch=0, poll=0.02)
+            raise AssertionError("a missing heartbeat must fail the guard")
+        except HciError as exc:
+            assert "no flood heartbeat" in str(exc), exc
+
+        # An unwritable heartbeat path has to be fatal at startup, not a silent no-op.
+        try:
+            write_heartbeat(os.path.join(tmpdir, "missing-dir", HEARTBEAT_FILENAME), 0, 40.0, b"")
+            raise AssertionError("an unwritable heartbeat path must fail")
+        except RuntimeError as exc:
+            assert "cannot write" in str(exc), exc
+
     print("selftest OK")
 
 
@@ -352,13 +595,31 @@ def main():
     p.add_argument("--rate", type=float, default=40.0, help="address rotations per second")
     p.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = forever)")
     p.add_argument("--selftest", action="store_true", help="verify framing, no hardware")
+    p.add_argument("--heartbeat", metavar="PATH",
+                   help="publish liveness here (default: $BLE_FLOOD_HEARTBEAT), so a guard step "
+                        "can see a detached flood that never started")
+    p.add_argument("--check-heartbeat", metavar="PATH",
+                   help="guard mode: fail unless a live flood is refreshing PATH")
+    p.add_argument("--wait", type=float, default=120.0,
+                   help="guard mode: seconds to wait for the heartbeat to appear")
+    p.add_argument("--stale", type=float, default=90.0,
+                   help="guard mode: fail once the heartbeat is older than this")
+    p.add_argument("--watch", type=float, default=0.0,
+                   help="guard mode: keep checking for this long before succeeding")
     args = p.parse_args()
 
     if args.selftest:
         selftest()
         return
+    if args.check_heartbeat:
+        check_heartbeat(args.check_heartbeat, args.wait, args.stale, args.watch)
+        return
     if args.rate <= 0:
         p.error("--rate must be positive")
+
+    heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
+    if heartbeat:
+        print(f"[flood] heartbeat -> {heartbeat}", flush=True)
 
     # The HIL runs this as a detached step, so it's PID 1 in its container and the runner stops
     # it with SIGTERM (docker stop). The kernel ignores un-handled signals for PID 1, so without
@@ -370,7 +631,7 @@ def main():
     sock = open_adapter(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
     try:
-        flood(sock, args.rate, args.seconds)
+        flood(sock, args.rate, args.seconds, heartbeat or None)
     except KeyboardInterrupt:
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         print("[flood] stopped on signal", flush=True)
