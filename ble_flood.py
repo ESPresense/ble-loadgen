@@ -68,6 +68,14 @@ RESET_TIMEOUT = 15.0
 RESET_ATTEMPTS = 3
 RESET_RETRY_DELAY = 1.0
 
+# The HIL runs the flood as a *detached* step, and a detached step cannot fail the pipeline: it
+# can die in its first second and the soak still reports green, having loaded the node with
+# nothing. So the flood publishes liveness to a file that a non-detached guard step reads, and the
+# soak asserts it was still fresh when the run ended. PID 1 in a container, so a file is the only
+# channel that crosses the step boundary.
+HEARTBEAT_FILENAME = "ble-flood.alive"
+HEARTBEAT_INTERVAL = 30.0
+
 
 def hci_command(opcode, params=b""):
     """Frame one HCI command packet: type, opcode (LE), parameter length, parameters."""
@@ -301,7 +309,67 @@ def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay
     raise HciError(f"HCI_Reset never completed in {attempts} attempts: {last}. {_silent_hint()}")
 
 
-def flood(sock, rate, stop_after):
+def write_heartbeat(path, rotations, rate, address):
+    """Publish flood liveness atomically, so a reader never catches a half-written file.
+
+    Failing to write is fatal on purpose: a heartbeat the pipeline cannot read is worse than no
+    heartbeat, because the guard would then fail every run and a mount problem would look like a
+    flood problem.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(f"pid={os.getpid()}\nrotations={rotations}\nrate={rate}\n"
+                     f"last_address={address.hex() if address else ''}\n"
+                     f"updated={time.time():.3f}\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot write flood heartbeat {path}: {exc}") from exc
+
+
+def _read_heartbeat(path):
+    """The parsed heartbeat, or None while it is not there yet."""
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
+    """Fail unless a live flood is refreshing ``path`` — the pipeline's non-detached guard.
+
+    The flood itself cannot fail the build (detached), so the check has to live in a step that
+    can. Waiting for the file catches a flood that never advertised at all; the staleness limit
+    catches one that started and then wedged. Either way the soak has no BLE load, which is worse
+    than a red build: it looks like evidence.
+    """
+    deadline = time.monotonic() + wait
+    while _read_heartbeat(path) is None:
+        if time.monotonic() >= deadline:
+            raise HciError(f"no flood heartbeat at {path} within {wait:g}s: the detached flood "
+                           f"never advertised anything, so this run has no BLE load")
+        time.sleep(poll)
+
+    stop = time.monotonic() + watch
+    while True:
+        fields = _read_heartbeat(path) or {}
+        try:
+            age = time.time() - float(fields["updated"])
+        except (KeyError, ValueError):
+            raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
+        if age > stale:
+            raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s): the "
+                           f"flood stopped after {fields.get('rotations')} rotations")
+        if time.monotonic() >= stop:
+            print(f"[flood] heartbeat OK: {age:.1f}s old, {fields.get('rotations')} rotations",
+                  flush=True)
+            return
+        time.sleep(poll)
+
+
+def flood(sock, rate, stop_after, heartbeat=None):
     """Rotate the advertised address forever (or until time runs out).
 
     Lifetime is the process's: the HIL pipeline runs this as a detached step, so the flood
@@ -313,6 +381,10 @@ def flood(sock, rate, stop_after):
     reset_controller(sock)
     time.sleep(0.1)
     send(sock, OCF_LE_SET_ADV_PARAMETERS, adv_parameters())
+    # Advertise-ready is the moment the guard cares about: from here the node is being loaded.
+    # Every later refresh only says the flood is still going.
+    if heartbeat:
+        write_heartbeat(heartbeat, 0, rate, b"")
 
     interval = 1.0 / rate
     started = time.monotonic()
@@ -332,9 +404,11 @@ def flood(sock, rate, stop_after):
         rotations += 1
 
         now = time.monotonic()
-        if now - reported >= 30:
+        if now - reported >= HEARTBEAT_INTERVAL:
             print(f"[flood] {rotations} unique addresses in {now - started:.0f}s "
                   f"({rotations / (now - started):.1f}/s)", flush=True)
+            if heartbeat:
+                write_heartbeat(heartbeat, rotations, rate, address)
             reported = now
         time.sleep(max(0.0, interval - (now - cycle)))
 
@@ -473,6 +547,45 @@ def selftest():
         assert "nothing arrived at all" in str(exc), exc
     quiet.close()
 
+    # The guard decides whether a dead flood is allowed to look like a passing run, so all three
+    # outcomes are pinned here: fresh passes, stale fails, absent fails. No hardware involved.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hb = os.path.join(tmpdir, HEARTBEAT_FILENAME)
+        write_heartbeat(hb, 1234, 40.0, bytes.fromhex("aabbccddeeff"))
+        fields = _read_heartbeat(hb)
+        assert fields["rotations"] == "1234" and fields["rate"] == "40.0", fields
+        assert fields["last_address"] == "aabbccddeeff", fields
+        assert abs(time.time() - float(fields["updated"])) < 5, fields
+        # The writer replaces atomically, so a reader must never see the temp file left behind.
+        assert not os.path.exists(f"{hb}.tmp"), "temp file left behind"
+        check_heartbeat(hb, wait=0.05, stale=60, watch=0, poll=0.02)
+
+        # Stale: the flood started and then stopped refreshing — the soak has no load.
+        with open(hb, "w") as fh:
+            fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
+        try:
+            check_heartbeat(hb, wait=0.05, stale=90, watch=0, poll=0.02)
+            raise AssertionError("a stale heartbeat must fail the guard")
+        except HciError as exc:
+            assert "600s old" in str(exc) and "99 rotations" in str(exc), exc
+
+        # Absent: the flood never advertised at all — the bench failure that went unnoticed.
+        try:
+            check_heartbeat(os.path.join(tmpdir, "never-created"), wait=0.05, stale=90,
+                            watch=0, poll=0.02)
+            raise AssertionError("a missing heartbeat must fail the guard")
+        except HciError as exc:
+            assert "no flood heartbeat" in str(exc), exc
+
+        # An unwritable heartbeat path has to be fatal at startup, not a silent no-op.
+        try:
+            write_heartbeat(os.path.join(tmpdir, "missing-dir", HEARTBEAT_FILENAME), 0, 40.0, b"")
+            raise AssertionError("an unwritable heartbeat path must fail")
+        except RuntimeError as exc:
+            assert "cannot write" in str(exc), exc
+
     print("selftest OK")
 
 
@@ -482,13 +595,31 @@ def main():
     p.add_argument("--rate", type=float, default=40.0, help="address rotations per second")
     p.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = forever)")
     p.add_argument("--selftest", action="store_true", help="verify framing, no hardware")
+    p.add_argument("--heartbeat", metavar="PATH",
+                   help="publish liveness here (default: $BLE_FLOOD_HEARTBEAT), so a guard step "
+                        "can see a detached flood that never started")
+    p.add_argument("--check-heartbeat", metavar="PATH",
+                   help="guard mode: fail unless a live flood is refreshing PATH")
+    p.add_argument("--wait", type=float, default=120.0,
+                   help="guard mode: seconds to wait for the heartbeat to appear")
+    p.add_argument("--stale", type=float, default=90.0,
+                   help="guard mode: fail once the heartbeat is older than this")
+    p.add_argument("--watch", type=float, default=0.0,
+                   help="guard mode: keep checking for this long before succeeding")
     args = p.parse_args()
 
     if args.selftest:
         selftest()
         return
+    if args.check_heartbeat:
+        check_heartbeat(args.check_heartbeat, args.wait, args.stale, args.watch)
+        return
     if args.rate <= 0:
         p.error("--rate must be positive")
+
+    heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
+    if heartbeat:
+        print(f"[flood] heartbeat -> {heartbeat}", flush=True)
 
     # The HIL runs this as a detached step, so it's PID 1 in its container and the runner stops
     # it with SIGTERM (docker stop). The kernel ignores un-handled signals for PID 1, so without
@@ -500,7 +631,7 @@ def main():
     sock = open_adapter(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
     try:
-        flood(sock, args.rate, args.seconds)
+        flood(sock, args.rate, args.seconds, heartbeat or None)
     except KeyboardInterrupt:
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         print("[flood] stopped on signal", flush=True)
