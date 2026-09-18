@@ -68,6 +68,21 @@ docker run --rm ghcr.io/espresense/ble-loadgen:1 --selftest
 `--cap-add NET_ADMIN` in place of `--privileged` also works; `--privileged` is what the HIL
 pipeline already grants, so the docs use it for parity.
 
+## Troubleshooting
+
+**`HCI_Reset` unanswered, or `no completion event`** — the controller is claimed (the bind
+succeeded, so nothing else can be driving it) but it is not answering. The reset is retried
+3 × 15s for exactly this reason: a command sent into the window right after a user-channel bind
+can be lost, or answered only once a USB part finishes its firmware setup. The bench hit this
+while crow did not. If it still gives up, the message prints the rfkill state and the causes a
+successful bind cannot explain — a soft rfkill block, an autosuspended USB port, a dongle that
+needs a re-plug, or a flood leaked from an earlier run (`pkill -f ble_flood.py`).
+
+**The bench is running old code.** `:1` and `:1.0` are semver tags: they only move when a `v*`
+git tag is pushed, while `latest`/`sha-*` track `main`. So a fix merged to `main` does *not*
+reach a pipeline that pins `:1` until a release is cut — which is how the bench spent six weeks
+on an image that predated the SIGTERM cleanup, leaving `hci0` wedged between runs.
+
 ## Why static random addresses with the MAC in the name
 
 ESPresense keys `ID_TYPE_RAND_STATIC_MAC` off the top two bits of the address MSB, so each

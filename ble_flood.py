@@ -24,6 +24,7 @@ import argparse
 import ctypes
 import errno as errno_mod
 import fcntl
+import glob
 import os
 import secrets
 import select
@@ -56,6 +57,16 @@ ADV_INTERVAL = 0x0020  # 20 ms — the BLE minimum, so a packet lands on all 3 c
 # (bluetoothd re-powering it, or the previous run's flood still exiting) and 30s covers both.
 # Make it a flag if the bench ever shows a legitimate wait longer than this.
 BIND_TIMEOUT = 30.0
+
+# The first command after the bind is the fragile one, and the bench proved it: HCI_Reset timed
+# out at 2s there on a controller that crow's never did. A bind hands us a controller the kernel
+# has just opened, so a command sent into that window can be lost, or answered only once a USB
+# part has finished its firmware setup. Idempotent and cheap to repeat, so it gets a longer wait
+# and retries; the per-rotation commands stay strict, because a wedged controller must still be
+# caught there rather than quietly radiating nothing.
+RESET_TIMEOUT = 15.0
+RESET_ATTEMPTS = 3
+RESET_RETRY_DELAY = 1.0
 
 
 def hci_command(opcode, params=b""):
@@ -219,10 +230,14 @@ def send(sock, opcode, params=b"", timeout=2.0):
     """
     sock.sendall(hci_command(opcode, params))
     deadline = time.monotonic() + timeout
+    drained = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise HciError(f"opcode 0x{opcode:04x}: no completion event within {timeout}s")
+            # "Nothing arrived" and "events arrived, just not this reply" are different faults,
+            # and the count is the only thing in a CI log that separates them.
+            saw = f"drained {drained} unrelated events" if drained else "nothing arrived at all"
+            raise HciError(f"opcode 0x{opcode:04x}: no completion event within {timeout}s ({saw})")
         if not select.select([sock], [], [], remaining)[0]:
             continue
         try:
@@ -231,10 +246,59 @@ def send(sock, opcode, params=b"", timeout=2.0):
             continue
         status = command_status(pkt, opcode)
         if status is None:
+            drained += 1
             continue  # an unrelated event (advertising reports etc.) — keep draining
         if status != 0x00:
             raise HciError(f"opcode 0x{opcode:04x} rejected with status 0x{status:02x}")
         return
+
+
+def _silent_hint():
+    """What to check when a claimed controller stops answering — the cases a bind cannot explain.
+
+    A successful bind already rules out the usual causes (adapter busy, no CAP_NET_ADMIN, wrong
+    netns), so what is left is controller-level: an rfkill block, an autosuspended USB port, or a
+    dongle left wedged by a flood leaked from a previous run. The rfkill state is read live
+    because it is the one of those that is visible from inside the container.
+    """
+    states = []
+    for path in sorted(glob.glob("/sys/class/bluetooth/hci*/rfkill*/state")):
+        try:
+            with open(path) as fh:
+                states.append(f"{path}={'blocked' if fh.read().strip() == '1' else 'unblocked'}")
+        except OSError:
+            pass
+    return ("The bind succeeded, so hciN is ours and nothing else can be driving it — the "
+            "controller is simply silent. Check `rfkill list` (a soft block leaves it silent), "
+            "that the USB port is not autosuspended, and whether the dongle needs a re-plug; a "
+            "flood leaked by an earlier run wedges it the same way (`pkill -f ble_flood.py`). "
+            f"rfkill: {', '.join(states) if states else 'unreadable'}")
+
+
+def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay=RESET_RETRY_DELAY):
+    """HCI_Reset until the controller answers it.
+
+    Safe to repeat: reset drops whatever state the controller was left in, which is why it is the
+    first command anyway. Retrying is what turns a controller that is still coming up into a
+    working flood instead of a failed HIL step.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            send(sock, OCF_RESET, timeout=timeout)
+        except HciError as exc:
+            last = exc
+            print(f"[flood] HCI_Reset unanswered after {timeout:g}s "
+                  f"(attempt {attempt}/{attempts})", flush=True)
+            if attempt < attempts:
+                time.sleep(delay)
+            continue
+        suffix = "" if attempt == 1 else f" (attempt {attempt})"
+        print(f"[flood] controller answered HCI_Reset in {time.monotonic() - started:.2f}s{suffix}",
+              flush=True)
+        return
+    raise HciError(f"HCI_Reset never completed in {attempts} attempts: {last}. {_silent_hint()}")
 
 
 def flood(sock, rate, stop_after):
@@ -246,7 +310,7 @@ def flood(sock, rate, stop_after):
     Order matters: the controller rejects LE Set Random Address while advertising is
     enabled, so each rotation is disable -> re-address -> enable.
     """
-    send(sock, OCF_RESET)
+    reset_controller(sock)
     time.sleep(0.1)
     send(sock, OCF_LE_SET_ADV_PARAMETERS, adv_parameters())
 
@@ -342,6 +406,72 @@ def selftest():
     busy = _bind_hint(0, None, errno_mod.EBUSY)
     assert "bluetoothd" in busy and "ble_flood.py" in busy, busy
     assert "CAP_NET_ADMIN" not in busy, busy
+
+    # The reset is the one command that must not give up early — the bench timed out on exactly
+    # it while crow never did. Both paths run against a socket-shaped fake, so CI fails if the
+    # retry is ever dropped: retry-then-succeed, and give-up-with-a-reason.
+    import threading
+
+    def fake_socket():
+        """A socket-shaped stand-in. select() needs a real fd, so wrap a socketpair."""
+
+        rd, wr = socket.socketpair()
+
+        class Fake:
+            def __init__(self):
+                self.sent = []
+
+            def fileno(self):
+                return rd.fileno()
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+            def recv(self, n):
+                return rd.recv(n)
+
+            def answer(self, opcode):
+                wr.send(bytes([HCI_EVENT_PKT, EVT_CMD_COMPLETE, 4, 1])
+                        + struct.pack("<H", opcode) + b"\x00")
+
+            def close(self):
+                rd.close()
+                wr.close()
+
+        return Fake()
+
+    # Answer only the second attempt: the first must time out and be retried, not fatal.
+    retrying = fake_socket()
+
+    def answer_on_second():
+        while len(retrying.sent) < 2:
+            time.sleep(0.005)
+        retrying.answer(OCF_RESET)
+
+    threading.Thread(target=answer_on_second, daemon=True).start()
+    reset_controller(retrying, timeout=0.2, attempts=3, delay=0.0)
+    assert len(retrying.sent) == 2, retrying.sent
+    assert all(pkt == hci_command(OCF_RESET) for pkt in retrying.sent), retrying.sent
+    retrying.close()
+
+    # Silence every attempt: it must fail with the attempt count and the cause, not hang.
+    dead = fake_socket()
+    try:
+        reset_controller(dead, timeout=0.05, attempts=3, delay=0.0)
+        raise AssertionError("a silent controller must not look like success")
+    except HciError as exc:
+        assert "3 attempts" in str(exc) and "rfkill" in str(exc), exc
+    assert len(dead.sent) == 3, dead.sent
+    dead.close()
+
+    # A timeout must say what it saw: silence and "events I could not use" differ.
+    quiet = fake_socket()
+    try:
+        send(quiet, OCF_LE_SET_ADV_ENABLE, b"\x01", timeout=0.05)
+        raise AssertionError("an unanswered command must raise")
+    except HciError as exc:
+        assert "nothing arrived at all" in str(exc), exc
+    quiet.close()
 
     print("selftest OK")
 
