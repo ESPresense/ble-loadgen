@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flood the bench with BLE advertisements from a fresh random address every time.
+"""Flood the bench with BLE advertisements, rotating through a pool of random addresses.
 
 Why: ESPresense fingerprints a *static random* address by MAC (BleFingerprint.cpp,
 ID_TYPE_RAND_STATIC_MAC when the top two bits of the MSB are set), so every rotation
@@ -15,8 +15,14 @@ other process has powered up.
 Runs as a detached step in the HIL pipeline (.woodpecker/hil.yml), so it floods for the
 run and the runner stops it at the end — no external gating.
 
+By default the addresses come from a pool of 4096 and repeat once it wraps. The node still
+sees a new MAC every rotation, but subscribers that key off the address (ESPresense Companion
+-> MQTT discovery -> a Home Assistant device_tracker each, BlueZ's own cache) stop at 4096
+rows instead of growing for as long as the flood runs. --pool 0 restores unbounded minting.
+
   ble_flood.py --index 0 --rate 40   # flood until killed
   ble_flood.py --index 0 --seconds 30  # one 30s burst
+  ble_flood.py --index 0 --pool 512  # smaller pool, same churn
   ble_flood.py --selftest            # framing/address rules, no hardware
 """
 
@@ -75,6 +81,9 @@ RESET_RETRY_DELAY = 1.0
 # channel that crosses the step boundary.
 HEARTBEAT_FILENAME = "ble-flood.alive"
 HEARTBEAT_INTERVAL = 30.0
+# Enough churn to exhaust a node's 100-200 fingerprint slots many times over, small enough
+# that downstream subscribers keyed on the address stay a bounded table. 0 = unbounded.
+DEFAULT_POOL = 4096
 
 
 def hci_command(opcode, params=b""):
@@ -82,6 +91,31 @@ def hci_command(opcode, params=b""):
     if len(params) > 255:
         raise ValueError(f"HCI parameters too long: {len(params)}")
     return struct.pack("<BHB", HCI_COMMAND_PKT, opcode, len(params)) + params
+
+
+def _env_int(name, default):
+    """Integer from the environment, falling back on anything unparseable."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def address_pool(size):
+    """A fixed set of static random addresses to cycle through, instead of endless new ones.
+
+    Unbounded rotation is a load test for the node but a leak for everything downstream:
+    subscribers that key off the address (ESPresense Companion -> MQTT discovery -> a Home
+    Assistant device_tracker per address, BlueZ's own /var/lib/bluetooth/*/cache) grow one
+    entry per rotation and never shrink. A soak run at 40/s minted 8.3M addresses in 58h and
+    left 53k orphaned HA entities behind. A pool keeps the node's fingerprint churn identical
+    -- it still sees a new MAC every rotation until the pool wraps -- while the downstream
+    row count stops at len(pool).
+    """
+    pool = set()
+    while len(pool) < size:
+        pool.add(random_static_address())
+    return sorted(pool)
 
 
 def random_static_address():
@@ -369,8 +403,11 @@ def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
         time.sleep(poll)
 
 
-def flood(sock, rate, stop_after, heartbeat=None):
+def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL):
     """Rotate the advertised address forever (or until time runs out).
+
+    Addresses come from a pool of pool_size and repeat once it wraps; pool_size=0 mints a
+    fresh one every rotation (unbounded -- see address_pool for what that costs downstream).
 
     Lifetime is the process's: the HIL pipeline runs this as a detached step, so the flood
     starts with the run and the runner kills it when the run ends. No external gating.
@@ -378,6 +415,10 @@ def flood(sock, rate, stop_after, heartbeat=None):
     Order matters: the controller rejects LE Set Random Address while advertising is
     enabled, so each rotation is disable -> re-address -> enable.
     """
+    pool = address_pool(pool_size) if pool_size else None
+    if pool:
+        print(f"[flood] cycling a pool of {len(pool)} addresses", flush=True)
+
     reset_controller(sock)
     time.sleep(0.1)
     send(sock, OCF_LE_SET_ADV_PARAMETERS, adv_parameters())
@@ -396,7 +437,7 @@ def flood(sock, rate, stop_after, heartbeat=None):
             break
 
         cycle = time.monotonic()
-        address = random_static_address()
+        address = pool[rotations % len(pool)] if pool else random_static_address()
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         send(sock, OCF_LE_SET_RANDOM_ADDRESS, address)
         send(sock, OCF_LE_SET_ADV_DATA, advertising_payload(address))
@@ -405,7 +446,8 @@ def flood(sock, rate, stop_after, heartbeat=None):
 
         now = time.monotonic()
         if now - reported >= HEARTBEAT_INTERVAL:
-            print(f"[flood] {rotations} unique addresses in {now - started:.0f}s "
+            print(f"[flood] {rotations} rotations over {len(pool) if pool else rotations} "
+                  f"addresses in {now - started:.0f}s "
                   f"({rotations / (now - started):.1f}/s)", flush=True)
             if heartbeat:
                 write_heartbeat(heartbeat, rotations, rate, address)
@@ -413,7 +455,8 @@ def flood(sock, rate, stop_after, heartbeat=None):
         time.sleep(max(0.0, interval - (now - cycle)))
 
     send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
-    print(f"[flood] stopped after {rotations} unique addresses", flush=True)
+    print(f"[flood] stopped after {rotations} rotations over "
+          f"{len(pool) if pool else rotations} addresses", flush=True)
 
 
 def selftest():
@@ -433,6 +476,25 @@ def selftest():
         assert rest not in (0, (1 << 46) - 1)
 
     assert len({random_static_address() for _ in range(5000)}) == 5000, "addresses repeat"
+
+    # A pool is exactly len(pool) distinct addresses, each still a valid static random one,
+    # and rotation n reuses pool[n % len] -- that wrap is the whole point: it caps how many
+    # rows a downstream subscriber keyed on the address can ever create.
+    pool = address_pool(256)
+    assert len(pool) == 256 and len(set(pool)) == 256, len(pool)
+    for addr in pool:
+        assert len(addr) == 6 and addr[5] & 0xC0 == 0xC0, addr.hex()
+    assert [pool[n % len(pool)] for n in (0, 255, 256, 257)] == [
+        pool[0], pool[255], pool[0], pool[1]], "pool must wrap"
+    assert address_pool(1) != address_pool(1), "pools must not be a fixed sequence"
+
+    # $BLE_FLOOD_POOL drives the default, and junk in the environment must not kill a run.
+    os.environ["BLE_FLOOD_POOL"] = "512"
+    assert _env_int("BLE_FLOOD_POOL", DEFAULT_POOL) == 512
+    os.environ["BLE_FLOOD_POOL"] = "not-a-number"
+    assert _env_int("BLE_FLOOD_POOL", DEFAULT_POOL) == DEFAULT_POOL
+    del os.environ["BLE_FLOOD_POOL"]
+    assert _env_int("BLE_FLOOD_POOL", DEFAULT_POOL) == DEFAULT_POOL
 
     # Every advert must carry an identity unique to its address, or ESPresense merges them.
     addr_a, addr_b = random_static_address(), random_static_address()
@@ -594,6 +656,10 @@ def main():
     p.add_argument("--index", type=int, default=0, help="hciN adapter index")
     p.add_argument("--rate", type=float, default=40.0, help="address rotations per second")
     p.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = forever)")
+    p.add_argument("--pool", type=int, default=None,
+                   help=f"cycle this many addresses instead of minting a new one every "
+                        f"rotation (default: $BLE_FLOOD_POOL or {DEFAULT_POOL}; 0 = unbounded, "
+                        f"which grows downstream tables forever)")
     p.add_argument("--selftest", action="store_true", help="verify framing, no hardware")
     p.add_argument("--heartbeat", metavar="PATH",
                    help="publish liveness here (default: $BLE_FLOOD_HEARTBEAT), so a guard step "
@@ -617,6 +683,10 @@ def main():
     if args.rate <= 0:
         p.error("--rate must be positive")
 
+    pool_size = args.pool if args.pool is not None else _env_int("BLE_FLOOD_POOL", DEFAULT_POOL)
+    if pool_size < 0:
+        p.error("--pool must not be negative")
+
     heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
     if heartbeat:
         print(f"[flood] heartbeat -> {heartbeat}", flush=True)
@@ -631,7 +701,7 @@ def main():
     sock = open_adapter(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
     try:
-        flood(sock, args.rate, args.seconds, heartbeat or None)
+        flood(sock, args.rate, args.seconds, heartbeat or None, pool_size)
     except KeyboardInterrupt:
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         print("[flood] stopped on signal", flush=True)

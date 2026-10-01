@@ -1,10 +1,11 @@
 # ble-loadgen
 
-BLE advertisement load generator for the ESPresense HIL bench. It advertises from a fresh
-**static random** address ~40 times a second, so every rotation costs a listening node a
-new fingerprint slot — a room full of phones, compressed. It exists to make the slow heap
-decline in [ESPresense#2309](https://github.com/ESPresense/ESPresense/issues/2309) show up
-in a HIL window instead of over days on a shelf.
+BLE advertisement load generator for the ESPresense HIL bench. It advertises from a
+**static random** address ~40 times a second, rotating through a pool of 4096 of them, so
+every rotation costs a listening node a new fingerprint slot — a room full of phones,
+compressed. It exists to make the slow heap decline in
+[ESPresense#2309](https://github.com/ESPresense/ESPresense/issues/2309) show up in a HIL
+window instead of over days on a shelf.
 
 Split out of `firmware-tester` because it shares nothing with it: no PlatformIO, no serial,
 no toolchain — just Python stdlib and a raw HCI socket. Its own image
@@ -47,7 +48,21 @@ The script is pure stdlib — run it directly:
 python3 ble_flood.py --selftest              # framing + address rules, no hardware
 sudo python3 ble_flood.py --index 0 --rate 40        # flood until killed
 sudo python3 ble_flood.py --index 0 --seconds 30     # one 30s burst
+sudo python3 ble_flood.py --index 0 --pool 512       # smaller address pool
 ```
+
+### Address pool
+
+Addresses come from a pool (default 4096, or `$BLE_FLOOD_POOL`) and repeat once it wraps.
+The churn a node sees is unchanged — every rotation is still a different MAC until the pool
+wraps — but anything downstream that keys off the address stops growing at `--pool` rows.
+That matters because the flood's addresses escape the bench: ESPresense Companion turns each
+one into an MQTT discovery config and Home Assistant into a `device_tracker`, and BlueZ
+caches each under `/var/lib/bluetooth/*/cache`. A 58-hour unbounded soak minted 8.3M
+addresses, left 53k orphaned HA entities, and exhausted the inodes on the HA host.
+
+`--pool 0` restores the old unbounded behaviour. Only use it against a bench whose
+subscribers you are willing to rebuild.
 
 ### Docker
 
