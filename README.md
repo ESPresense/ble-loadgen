@@ -73,6 +73,11 @@ UUID every `--ibeacon-period` seconds (default 30), the way a BC04P does while i
 is logged as `[flood] ibeacon <n> uuid <uuid> (phase <p>)`, so a run can assert on what it
 should have seen.
 
+**Ignoring them downstream:** every loadgen iBeacon UUID starts with `f1ad0000`, so
+Companion and other consumers can drop the flood's beacons by prefix (`f1ad0000-` in the UUID
+string). `--ibeacons` is capped at 65535, because beacon *i* advertises major *i + 1* and the
+major is 16 bits; larger values are rejected at startup.
+
 ### Docker
 
 The image entrypoint is `python3 ble_flood.py`, so arguments go straight after the image.

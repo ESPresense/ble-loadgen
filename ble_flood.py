@@ -96,6 +96,11 @@ IBEACON_EVERY = 4     # every Nth rotation is a beacon advert, the rest are pool
 IBEACON_PERIOD = 30.0  # seconds a beacon's UUID stays the same
 IBEACON_TX_POWER = -59  # dBm at 1m, the byte ESPresense reads as the calibrated reference
 IBEACON_NAMESPACE = uuid.NAMESPACE_URL
+# Every loadgen iBeacon UUID starts with this, so consumers (ESPresense Companion, Home Assistant)
+# can drop the flood's beacons by prefix. Hex, 4 bytes: the first 8 characters of the UUID.
+LOADGEN_UUID_PREFIX = "f1ad0000"
+# Beacon i advertises major i + 1, and major is 16 bits, so the largest count is 0xFFFF.
+IBEACON_MAX_COUNT = 0xFFFF
 
 
 def hci_command(opcode, params=b""):
@@ -166,8 +171,18 @@ def advertising_payload(address):
 
 
 def ibeacon_uuid(index, phase):
-    """Proximity UUID for beacon ``index`` during change period ``phase``. Stable within a period."""
-    return uuid.uuid5(IBEACON_NAMESPACE, f"ble-loadgen:ibeacon:{index}:{phase}")
+    """Proximity UUID for beacon ``index`` during change period ``phase``. Stable within a period.
+
+    The first 4 bytes are LOADGEN_UUID_PREFIX; the rest is a name-based hash of index and phase.
+    """
+    derived = uuid.uuid5(IBEACON_NAMESPACE, f"ble-loadgen:ibeacon:{index}:{phase}").hex
+    return uuid.UUID(LOADGEN_UUID_PREFIX + derived[len(LOADGEN_UUID_PREFIX):])
+
+
+def validate_beacon_count(count):
+    """Raise ValueError unless ``count`` beacons fit the iBeacon major field (beacon i = major i+1)."""
+    if not 0 <= count <= IBEACON_MAX_COUNT:
+        raise ValueError(f"ibeacon count must be 0..{IBEACON_MAX_COUNT} (the major is 16 bits), got {count}")
 
 
 def ibeacon_payload(proximity_uuid, major, minor, tx_power=IBEACON_TX_POWER):
@@ -455,6 +470,7 @@ def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
 
 def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
           beacon_count=IBEACON_COUNT, beacon_period=IBEACON_PERIOD):
+    validate_beacon_count(beacon_count)  # before any HCI command, so a bad count never claims the adapter
     """Rotate the advertised address forever (or until time runs out).
 
     Addresses come from a pool of pool_size and repeat once it wraps; pool_size=0 mints a
@@ -562,6 +578,21 @@ def selftest():
     assert frame[1:4] == b"\x02\x01\x06" and frame[4:6] == b"\x1a\xff", frame.hex()
     assert frame[6:10] == b"\x4c\x00\x02\x15" and frame[10:26] == beacon_uuid.bytes, frame.hex()
     assert frame[26:30] == b"\x00\x01\x00\x01" and frame[30] == IBEACON_TX_POWER & 0xFF, frame.hex()
+    # Every loadgen UUID carries the standard prefix, and the limit is the 16-bit major.
+    assert all(ibeacon_uuid(i, p).hex.startswith(LOADGEN_UUID_PREFIX) for i in range(4) for p in range(4))
+    validate_beacon_count(IBEACON_MAX_COUNT)
+    for bad in (-1, IBEACON_MAX_COUNT + 1):
+        try:
+            validate_beacon_count(bad)
+            raise AssertionError(f"ibeacon count {bad} must be rejected")
+        except ValueError:
+            pass
+    try:
+        flood(None, rate=40, stop_after=0.01, beacon_count=IBEACON_MAX_COUNT + 1)
+        raise AssertionError("flood must reject an oversized beacon count before touching the adapter")
+    except ValueError:
+        pass
+
     # A UUID holds for its period, and differs across beacons and periods, or ESPresense sees no change.
     assert ibeacon_uuid(0, 0) == ibeacon_uuid(0, 0)
     assert len({ibeacon_uuid(i, p) for i in range(4) for p in range(4)}) == 16, "UUIDs must not repeat"
@@ -794,8 +825,10 @@ def main():
         p.error("--pool must not be negative")
 
     beacon_count = args.ibeacons if args.ibeacons is not None else _env_int("BLE_FLOOD_IBEACONS", IBEACON_COUNT)
-    if beacon_count < 0:
-        p.error("--ibeacons must not be negative")
+    try:
+        validate_beacon_count(beacon_count)
+    except ValueError as exc:
+        p.error(str(exc))
     if args.ibeacon_period <= 0:
         p.error("--ibeacon-period must be positive")
 
