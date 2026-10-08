@@ -31,6 +31,7 @@ import ctypes
 import errno as errno_mod
 import fcntl
 import glob
+import math
 import os
 import secrets
 import select
@@ -116,6 +117,18 @@ def _env_int(name, default):
         return int(os.environ[name])
     except (KeyError, ValueError):
         return default
+
+
+def validate_period(period):
+    """Raise ValueError unless ``period`` is a positive, finite number of seconds.
+
+    ``period <= 0`` alone lets nan and +inf through: nan compares false to everything, so it
+    passes, and the first beacon slot then dies in ``int(elapsed // period)`` (ValueError: cannot
+    convert float NaN to integer); +inf instead pins ``elapsed // period`` to 0.0, so the UUID
+    never changes and the run silently stops exercising the path it was started for.
+    """
+    if not math.isfinite(period) or period <= 0:
+        raise ValueError(f"period must be a positive, finite number of seconds, got {period!r}")
 
 
 def address_pool(size):
@@ -470,7 +483,6 @@ def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
 
 def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
           beacon_count=IBEACON_COUNT, beacon_period=IBEACON_PERIOD):
-    validate_beacon_count(beacon_count)  # before any HCI command, so a bad count never claims the adapter
     """Rotate the advertised address forever (or until time runs out).
 
     Addresses come from a pool of pool_size and repeat once it wraps; pool_size=0 mints a
@@ -482,6 +494,9 @@ def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
     Order matters: the controller rejects LE Set Random Address while advertising is
     enabled, so each rotation is disable -> re-address -> enable.
     """
+    # Before any HCI command, so a bad argument never claims the adapter.
+    validate_beacon_count(beacon_count)
+    validate_period(beacon_period)
     pool = address_pool(pool_size) if pool_size else None
     if pool:
         print(f"[flood] cycling a pool of {len(pool)} addresses", flush=True)
@@ -593,6 +608,16 @@ def selftest():
     except ValueError:
         pass
 
+    # The period must be positive *and* finite. nan compares false to <= 0, and +inf is greater
+    # than it, so a plain `<= 0` check passes both and the run then dies or silently stops rotating.
+    validate_period(IBEACON_PERIOD)
+    for bad in (0, -1.0, float("nan"), float("inf"), float("-inf")):
+        try:
+            validate_period(bad)
+            raise AssertionError(f"ibeacon period {bad!r} must be rejected")
+        except ValueError:
+            pass
+
     # A UUID holds for its period, and differs across beacons and periods, or ESPresense sees no change.
     assert ibeacon_uuid(0, 0) == ibeacon_uuid(0, 0)
     assert len({ibeacon_uuid(i, p) for i in range(4) for p in range(4)}) == 16, "UUIDs must not repeat"
@@ -608,6 +633,7 @@ def selftest():
     assert [p[0] for p in plan if p[2] is None] == [pool16[0], pool16[1], pool16[2], pool16[3], pool16[4],
                                                     pool16[5]], "pool adverts must take entries in order"
     assert advert_for(0, 31.0, pool16, beacons2)[3] == 1 and advert_for(0, 29.0, pool16, beacons2)[3] == 0
+    assert advert_for(0, 45.0, pool16, beacons2)[3] == 1, "phase must advance by period"
     assert advert_for(0, 31.0, pool16, beacons2)[1] != plan[0][1], "payload must change with the UUID"
     assert advert_for(5, 0.0, pool16, [])[2] is None, "no beacons means no iBeacon adverts"
     assert advert_for(5, 0.0, pool16, [])[0] == pool16[5], "without beacons the pool index is the rotation"
@@ -829,8 +855,10 @@ def main():
         validate_beacon_count(beacon_count)
     except ValueError as exc:
         p.error(str(exc))
-    if args.ibeacon_period <= 0:
-        p.error("--ibeacon-period must be positive")
+    try:
+        validate_period(args.ibeacon_period)
+    except ValueError as exc:
+        p.error(str(exc))
 
     heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
     if heartbeat:
