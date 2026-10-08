@@ -108,17 +108,20 @@ reaches the bench only once it has been released.
    including a changed default (v1.1.0 bounded the address pool). Bump the major only when
    an existing invocation would break, such as a removed or renamed flag or a changed
    entrypoint, since that is what moves people off `:1`.
-3. **Tag the merge commit and push the tag.** Tags are lightweight and are always cut from
-   `main`, never from a feature branch:
+3. **Tag the merge commit and push the tag.** Set `VERSION` to the version from step 2 and
+   use it in every command below (the examples use `v1.2.1`; `v1.2.0` already exists, so
+   reusing it fails with `fatal: tag already exists`). Tags are lightweight and are always cut
+   from `main`, never from a feature branch:
 
    ```bash
+   VERSION=v1.2.1
    git fetch origin
-   git tag v1.2.0 origin/main
-   git push origin v1.2.0
+   git tag "$VERSION" origin/main
+   git push origin "$VERSION"
    ```
 
 4. **Check the image.** The tag starts *Build and Push Docker Image*, which publishes
-   `1.2.0`, `1.2` and `1`:
+   `1.2.1`, `1.2` and `1`:
 
    ```bash
    gh run list --workflow docker.yml -L 1
@@ -129,7 +132,7 @@ reaches the bench only once it has been released.
    everyone pinned to `:1` gets it without asking:
 
    ```bash
-   gh release create v1.2.0 --generate-notes
+   gh release create "$VERSION" --generate-notes
    ```
 
 ## Troubleshooting
