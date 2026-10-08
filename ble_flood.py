@@ -194,7 +194,12 @@ def advert_for(rotation, elapsed, pool, beacons, period=IBEACON_PERIOD):
         phase = int(elapsed // period)
         payload = ibeacon_payload(ibeacon_uuid(index, phase), index + 1, 1)
         return beacons[index], payload, index, phase
-    address = pool[rotation % len(pool)] if pool else random_static_address()
+    # Pool adverts take the rotations that are not beacon slots, so the pool index is their ordinal
+    # among those. Indexing by rotation would skip every pool entry whose index is a multiple of
+    # IBEACON_EVERY, because those rotations are always beacon slots.
+    beacon_slots = (rotation + IBEACON_EVERY - 1) // IBEACON_EVERY if beacons else 0
+    ordinal = rotation - beacon_slots
+    address = pool[ordinal % len(pool)] if pool else random_static_address()
     return address, advertising_payload(address), None, None
 
 
@@ -569,10 +574,28 @@ def selftest():
     assert [p[2] for p in plan] == [0, None, None, None, 1, None, None, None, 0], [p[2] for p in plan]
     assert all(p[0] in beacons2 for p in plan if p[2] is not None)
     assert all(p[0] in pool16 for p in plan if p[2] is None)
-    assert plan[1][0] == pool16[1] and plan[2][0] == pool16[2], "pool adverts must still rotate"
+    assert [p[0] for p in plan if p[2] is None] == [pool16[0], pool16[1], pool16[2], pool16[3], pool16[4],
+                                                    pool16[5]], "pool adverts must take entries in order"
     assert advert_for(0, 31.0, pool16, beacons2)[3] == 1 and advert_for(0, 29.0, pool16, beacons2)[3] == 0
     assert advert_for(0, 31.0, pool16, beacons2)[1] != plan[0][1], "payload must change with the UUID"
     assert advert_for(5, 0.0, pool16, [])[2] is None, "no beacons means no iBeacon adverts"
+    assert advert_for(5, 0.0, pool16, [])[0] == pool16[5], "without beacons the pool index is the rotation"
+
+    # A complete pool cycle must visit every entry, with beacon slots taking none of them. Checked
+    # at the default size, where rotation-indexing silently dropped a quarter of the pool.
+    for size, beacon_list in ((16, beacons2), (DEFAULT_POOL, beacons2)):
+        full_pool = address_pool(size)
+        adverts = []
+        n = 0
+        while len(adverts) < 2 * size:
+            address, _, index, _ = advert_for(n, 0.0, full_pool, beacon_list)
+            if index is None:
+                adverts.append(address)
+            else:
+                assert address in beacon_list, "a beacon slot must use a beacon MAC"
+            n += 1
+        assert set(adverts[:size]) == set(full_pool), f"pool of {size}: a cycle must visit every entry"
+        assert adverts[size:2 * size] == adverts[:size], f"pool of {size}: the cycle must wrap in order"
 
     # Every advert must carry an identity unique to its address, or ESPresense merges them.
     addr_a, addr_b = random_static_address(), random_static_address()
