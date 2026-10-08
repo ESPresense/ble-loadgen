@@ -97,6 +97,41 @@ docker run --rm ghcr.io/espresense/ble-loadgen:1 --selftest
 `--cap-add NET_ADMIN` in place of `--privileged` also works; `--privileged` is what the HIL
 pipeline already grants, so the docs use it for parity.
 
+## Releasing
+
+Every push to `main` publishes `latest` and `sha-<short>`. The semver tags the HIL pipeline
+pins (`:1`, `:1.2`, `:1.2.0`) move only when a `v*` git tag is pushed, so a merged change
+reaches the bench only once it has been released.
+
+1. **Merge to `main` through a PR**, and wait for CI (`--selftest`) to pass on the merge commit.
+2. **Pick the version.** Bump the patch for fixes and the minor for new flags or behaviour,
+   including a changed default (v1.1.0 bounded the address pool). Bump the major only when
+   an existing invocation would break, such as a removed or renamed flag or a changed
+   entrypoint, since that is what moves people off `:1`.
+3. **Tag the merge commit and push the tag.** Tags are lightweight and are always cut from
+   `main`, never from a feature branch:
+
+   ```bash
+   git fetch origin
+   git tag v1.2.0 origin/main
+   git push origin v1.2.0
+   ```
+
+4. **Check the image.** The tag starts *Build and Push Docker Image*, which publishes
+   `1.2.0`, `1.2` and `1`:
+
+   ```bash
+   gh run list --workflow docker.yml -L 1
+   ```
+
+5. **Publish a GitHub Release** for the tag. `--generate-notes` lists the merged PRs; for
+   anything beyond that, write the notes by hand. Call out any change to a default, because
+   everyone pinned to `:1` gets it without asking:
+
+   ```bash
+   gh release create v1.2.0 --generate-notes
+   ```
+
 ## Troubleshooting
 
 **`HCI_Reset` unanswered, or `no completion event`** — the controller is claimed (the bind
