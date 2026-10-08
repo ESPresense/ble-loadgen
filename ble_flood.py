@@ -31,6 +31,7 @@ import ctypes
 import errno as errno_mod
 import fcntl
 import glob
+import math
 import os
 import secrets
 import select
@@ -38,6 +39,7 @@ import signal
 import socket
 import struct
 import time
+import uuid
 
 AF_BLUETOOTH = 31
 BTPROTO_HCI = 1
@@ -85,6 +87,22 @@ HEARTBEAT_INTERVAL = 30.0
 # that downstream subscribers keyed on the address stay a bounded table. 0 = unbounded.
 DEFAULT_POOL = 4096
 
+# iBeacon adverts for the bench. A real beacon keeps its MAC but changes its proximity UUID while
+# moving (BlueCharm BC04P, ESPresense#2492), and ESPresense must track each UUID as its own
+# fingerprint. So some rotations advertise a fixed set of beacon MACs, and each beacon's UUID
+# changes every IBEACON_PERIOD seconds. The schedule is deterministic and logged, so a run can
+# assert on what it should have seen.
+IBEACON_COUNT = 2     # beacon MACs; 0 turns iBeacon adverts off
+IBEACON_EVERY = 4     # every Nth rotation is a beacon advert, the rest are pool adverts
+IBEACON_PERIOD = 30.0  # seconds a beacon's UUID stays the same
+IBEACON_TX_POWER = -59  # dBm at 1m, the byte ESPresense reads as the calibrated reference
+IBEACON_NAMESPACE = uuid.NAMESPACE_URL
+# Every loadgen iBeacon UUID starts with this, so consumers (ESPresense Companion, Home Assistant)
+# can drop the flood's beacons by prefix. Hex, 4 bytes: the first 8 characters of the UUID.
+LOADGEN_UUID_PREFIX = "f1ad0000"
+# Beacon i advertises major i + 1, and major is 16 bits, so the largest count is 0xFFFF.
+IBEACON_MAX_COUNT = 0xFFFF
+
 
 def hci_command(opcode, params=b""):
     """Frame one HCI command packet: type, opcode (LE), parameter length, parameters."""
@@ -99,6 +117,18 @@ def _env_int(name, default):
         return int(os.environ[name])
     except (KeyError, ValueError):
         return default
+
+
+def validate_period(period):
+    """Raise ValueError unless ``period`` is a positive, finite number of seconds.
+
+    ``period <= 0`` alone lets nan and +inf through: nan compares false to everything, so it
+    passes, and the first beacon slot then dies in ``int(elapsed // period)`` (ValueError: cannot
+    convert float NaN to integer); +inf instead pins ``elapsed // period`` to 0.0, so the UUID
+    never changes and the run silently stops exercising the path it was started for.
+    """
+    if not math.isfinite(period) or period <= 0:
+        raise ValueError(f"period must be a positive, finite number of seconds, got {period!r}")
 
 
 def address_pool(size):
@@ -151,6 +181,54 @@ def advertising_payload(address):
     if len(fields) > 31:
         raise ValueError(f"advertising payload too long: {len(fields)}")
     return bytes([len(fields)]) + fields.ljust(31, b"\x00")
+
+
+def ibeacon_uuid(index, phase):
+    """Proximity UUID for beacon ``index`` during change period ``phase``. Stable within a period.
+
+    The first 4 bytes are LOADGEN_UUID_PREFIX; the rest is a name-based hash of index and phase.
+    """
+    derived = uuid.uuid5(IBEACON_NAMESPACE, f"ble-loadgen:ibeacon:{index}:{phase}").hex
+    return uuid.UUID(LOADGEN_UUID_PREFIX + derived[len(LOADGEN_UUID_PREFIX):])
+
+
+def validate_beacon_count(count):
+    """Raise ValueError unless ``count`` beacons fit the iBeacon major field (beacon i = major i+1)."""
+    if not 0 <= count <= IBEACON_MAX_COUNT:
+        raise ValueError(f"ibeacon count must be 0..{IBEACON_MAX_COUNT} (the major is 16 bits), got {count}")
+
+
+def ibeacon_payload(proximity_uuid, major, minor, tx_power=IBEACON_TX_POWER):
+    """Flags + Apple iBeacon manufacturer data, in the frame ESPresense parses (25 mfg bytes).
+
+    Layout: 4c 00 (Apple) 02 15 (iBeacon), 16-byte UUID, major, minor, tx power. No name: the
+    UUID is the identity, and the payload stays inside 31 bytes with room to spare.
+    """
+    mfg = b"\x4c\x00\x02\x15" + proximity_uuid.bytes + struct.pack(">HHb", major, minor, tx_power)
+    fields = bytes([2, 0x01, 0x06]) + bytes([len(mfg) + 1, 0xFF]) + mfg
+    if len(fields) > 31:
+        raise ValueError(f"iBeacon payload too long: {len(fields)}")
+    return bytes([len(fields)]) + fields.ljust(31, b"\x00")
+
+
+def advert_for(rotation, elapsed, pool, beacons, period=IBEACON_PERIOD):
+    """What rotation ``rotation`` advertises, as (address, payload, beacon_index, phase).
+
+    Every IBEACON_EVERY-th rotation is an iBeacon from the fixed beacon MACs, taking them in turn.
+    The rest are pool adverts, exactly as before. beacon_index and phase are None for pool adverts.
+    """
+    if beacons and rotation % IBEACON_EVERY == 0:
+        index = (rotation // IBEACON_EVERY) % len(beacons)
+        phase = int(elapsed // period)
+        payload = ibeacon_payload(ibeacon_uuid(index, phase), index + 1, 1)
+        return beacons[index], payload, index, phase
+    # Pool adverts take the rotations that are not beacon slots, so the pool index is their ordinal
+    # among those. Indexing by rotation would skip every pool entry whose index is a multiple of
+    # IBEACON_EVERY, because those rotations are always beacon slots.
+    beacon_slots = (rotation + IBEACON_EVERY - 1) // IBEACON_EVERY if beacons else 0
+    ordinal = rotation - beacon_slots
+    address = pool[ordinal % len(pool)] if pool else random_static_address()
+    return address, advertising_payload(address), None, None
 
 
 def adv_parameters():
@@ -403,7 +481,8 @@ def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
         time.sleep(poll)
 
 
-def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL):
+def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
+          beacon_count=IBEACON_COUNT, beacon_period=IBEACON_PERIOD):
     """Rotate the advertised address forever (or until time runs out).
 
     Addresses come from a pool of pool_size and repeat once it wraps; pool_size=0 mints a
@@ -415,9 +494,16 @@ def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL):
     Order matters: the controller rejects LE Set Random Address while advertising is
     enabled, so each rotation is disable -> re-address -> enable.
     """
+    # Before any HCI command, so a bad argument never claims the adapter.
+    validate_beacon_count(beacon_count)
+    validate_period(beacon_period)
     pool = address_pool(pool_size) if pool_size else None
     if pool:
         print(f"[flood] cycling a pool of {len(pool)} addresses", flush=True)
+    beacons = [random_static_address() for _ in range(beacon_count)]
+    for index, address in enumerate(beacons):
+        print(f"[flood] ibeacon {index} mac {address[::-1].hex()} major {index + 1}", flush=True)
+    announced = {}  # beacon index -> last phase logged, so each UUID change is logged once
 
     reset_controller(sock)
     time.sleep(0.1)
@@ -437,10 +523,14 @@ def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL):
             break
 
         cycle = time.monotonic()
-        address = pool[rotations % len(pool)] if pool else random_static_address()
+        address, payload, index, phase = advert_for(rotations, cycle - started, pool, beacons, beacon_period)
+        if index is not None and announced.get(index) != phase:
+            announced[index] = phase
+            uid = ibeacon_uuid(index, phase)
+            print(f"[flood] ibeacon {index} uuid {uid} (phase {phase})", flush=True)
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         send(sock, OCF_LE_SET_RANDOM_ADDRESS, address)
-        send(sock, OCF_LE_SET_ADV_DATA, advertising_payload(address))
+        send(sock, OCF_LE_SET_ADV_DATA, payload)
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x01")
         rotations += 1
 
@@ -495,6 +585,74 @@ def selftest():
     assert _env_int("BLE_FLOOD_POOL", DEFAULT_POOL) == DEFAULT_POOL
     del os.environ["BLE_FLOOD_POOL"]
     assert _env_int("BLE_FLOOD_POOL", DEFAULT_POOL) == DEFAULT_POOL
+
+    # iBeacon adverts: the frame the firmware parses (4c00 0215, UUID, major, minor, rssi@1m last).
+    beacon_uuid = ibeacon_uuid(0, 0)
+    frame = ibeacon_payload(beacon_uuid, 1, 1)
+    assert len(frame) == 32 and frame[0] == 30, frame.hex()
+    assert frame[1:4] == b"\x02\x01\x06" and frame[4:6] == b"\x1a\xff", frame.hex()
+    assert frame[6:10] == b"\x4c\x00\x02\x15" and frame[10:26] == beacon_uuid.bytes, frame.hex()
+    assert frame[26:30] == b"\x00\x01\x00\x01" and frame[30] == IBEACON_TX_POWER & 0xFF, frame.hex()
+    # Every loadgen UUID carries the standard prefix, and the limit is the 16-bit major.
+    assert all(ibeacon_uuid(i, p).hex.startswith(LOADGEN_UUID_PREFIX) for i in range(4) for p in range(4))
+    validate_beacon_count(IBEACON_MAX_COUNT)
+    for bad in (-1, IBEACON_MAX_COUNT + 1):
+        try:
+            validate_beacon_count(bad)
+            raise AssertionError(f"ibeacon count {bad} must be rejected")
+        except ValueError:
+            pass
+    try:
+        flood(None, rate=40, stop_after=0.01, beacon_count=IBEACON_MAX_COUNT + 1)
+        raise AssertionError("flood must reject an oversized beacon count before touching the adapter")
+    except ValueError:
+        pass
+
+    # The period must be positive *and* finite. nan compares false to <= 0, and +inf is greater
+    # than it, so a plain `<= 0` check passes both and the run then dies or silently stops rotating.
+    validate_period(IBEACON_PERIOD)
+    for bad in (0, -1.0, float("nan"), float("inf"), float("-inf")):
+        try:
+            validate_period(bad)
+            raise AssertionError(f"ibeacon period {bad!r} must be rejected")
+        except ValueError:
+            pass
+
+    # A UUID holds for its period, and differs across beacons and periods, or ESPresense sees no change.
+    assert ibeacon_uuid(0, 0) == ibeacon_uuid(0, 0)
+    assert len({ibeacon_uuid(i, p) for i in range(4) for p in range(4)}) == 16, "UUIDs must not repeat"
+
+    # The schedule: every IBEACON_EVERY-th rotation is a beacon, beacons take turns, and a beacon
+    # advertises from its own MAC only. Pool adverts keep the pool wrap. Phase follows elapsed time.
+    pool16 = address_pool(16)
+    beacons2 = [random_static_address(), random_static_address()]
+    plan = [advert_for(n, 0.0, pool16, beacons2) for n in range(9)]
+    assert [p[2] for p in plan] == [0, None, None, None, 1, None, None, None, 0], [p[2] for p in plan]
+    assert all(p[0] in beacons2 for p in plan if p[2] is not None)
+    assert all(p[0] in pool16 for p in plan if p[2] is None)
+    assert [p[0] for p in plan if p[2] is None] == [pool16[0], pool16[1], pool16[2], pool16[3], pool16[4],
+                                                    pool16[5]], "pool adverts must take entries in order"
+    assert advert_for(0, 31.0, pool16, beacons2)[3] == 1 and advert_for(0, 29.0, pool16, beacons2)[3] == 0
+    assert advert_for(0, 45.0, pool16, beacons2)[3] == 1, "phase must advance by period"
+    assert advert_for(0, 31.0, pool16, beacons2)[1] != plan[0][1], "payload must change with the UUID"
+    assert advert_for(5, 0.0, pool16, [])[2] is None, "no beacons means no iBeacon adverts"
+    assert advert_for(5, 0.0, pool16, [])[0] == pool16[5], "without beacons the pool index is the rotation"
+
+    # A complete pool cycle must visit every entry, with beacon slots taking none of them. Checked
+    # at the default size, where rotation-indexing silently dropped a quarter of the pool.
+    for size, beacon_list in ((16, beacons2), (DEFAULT_POOL, beacons2)):
+        full_pool = address_pool(size)
+        adverts = []
+        n = 0
+        while len(adverts) < 2 * size:
+            address, _, index, _ = advert_for(n, 0.0, full_pool, beacon_list)
+            if index is None:
+                adverts.append(address)
+            else:
+                assert address in beacon_list, "a beacon slot must use a beacon MAC"
+            n += 1
+        assert set(adverts[:size]) == set(full_pool), f"pool of {size}: a cycle must visit every entry"
+        assert adverts[size:2 * size] == adverts[:size], f"pool of {size}: the cycle must wrap in order"
 
     # Every advert must carry an identity unique to its address, or ESPresense merges them.
     addr_a, addr_b = random_static_address(), random_static_address()
@@ -660,6 +818,11 @@ def main():
                    help=f"cycle this many addresses instead of minting a new one every "
                         f"rotation (default: $BLE_FLOOD_POOL or {DEFAULT_POOL}; 0 = unbounded, "
                         f"which grows downstream tables forever)")
+    p.add_argument("--ibeacons", type=int, default=None,
+                   help=f"fixed beacon MACs advertising changing iBeacon UUIDs, 0 = off (default: "
+                        f"$BLE_FLOOD_IBEACONS or {IBEACON_COUNT})")
+    p.add_argument("--ibeacon-period", type=float, default=IBEACON_PERIOD,
+                   help=f"seconds before a beacon's UUID changes (default {IBEACON_PERIOD:g})")
     p.add_argument("--selftest", action="store_true", help="verify framing, no hardware")
     p.add_argument("--heartbeat", metavar="PATH",
                    help="publish liveness here (default: $BLE_FLOOD_HEARTBEAT), so a guard step "
@@ -687,6 +850,16 @@ def main():
     if pool_size < 0:
         p.error("--pool must not be negative")
 
+    beacon_count = args.ibeacons if args.ibeacons is not None else _env_int("BLE_FLOOD_IBEACONS", IBEACON_COUNT)
+    try:
+        validate_beacon_count(beacon_count)
+    except ValueError as exc:
+        p.error(str(exc))
+    try:
+        validate_period(args.ibeacon_period)
+    except ValueError as exc:
+        p.error(str(exc))
+
     heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
     if heartbeat:
         print(f"[flood] heartbeat -> {heartbeat}", flush=True)
@@ -701,7 +874,7 @@ def main():
     sock = open_adapter(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
     try:
-        flood(sock, args.rate, args.seconds, heartbeat or None, pool_size)
+        flood(sock, args.rate, args.seconds, heartbeat or None, pool_size, beacon_count, args.ibeacon_period)
     except KeyboardInterrupt:
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         print("[flood] stopped on signal", flush=True)

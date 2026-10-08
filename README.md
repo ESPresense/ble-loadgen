@@ -64,6 +64,20 @@ addresses, left 53k orphaned HA entities, and exhausted the inodes on the HA hos
 `--pool 0` restores the old unbounded behaviour. Only use it against a bench whose
 subscribers you are willing to rebuild.
 
+### iBeacons
+
+Some rotations advertise iBeacon frames instead, from a fixed set of MACs (`--ibeacons`, default
+2; `$BLE_FLOOD_IBEACONS`; 0 turns them off). Each beacon keeps its MAC and changes its proximity
+UUID every `--ibeacon-period` seconds (default 30), the way a BC04P does while in motion
+(ESPresense#2492). The UUIDs are derived from the beacon index and the period, and every change
+is logged as `[flood] ibeacon <n> uuid <uuid> (phase <p>)`, so a run can assert on what it
+should have seen.
+
+**Ignoring them downstream:** every loadgen iBeacon UUID starts with `f1ad0000`, so
+Companion and other consumers can drop the flood's beacons by prefix (`f1ad0000-` in the UUID
+string). `--ibeacons` is capped at 65535, because beacon *i* advertises major *i + 1* and the
+major is 16 bits; larger values are rejected at startup.
+
 ### Docker
 
 The image entrypoint is `python3 ble_flood.py`, so arguments go straight after the image.
