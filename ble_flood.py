@@ -376,6 +376,22 @@ def send(sock, opcode, params=b"", timeout=2.0):
         return
 
 
+def _rfkill_state(path):
+    """The hciN rfkill state by the kernel's own names, from Documentation/ABI/stable/sysfs-class-rfkill.
+
+    0 RFKILL_STATE_SOFT_BLOCKED, 1 RFKILL_STATE_UNBLOCKED, 2 RFKILL_STATE_HARD_BLOCKED. The file
+    is tiny and read without locking; anything else (including empty) is reported verbatim rather
+    than guessed, because a wrong label here sent one HIL debugging session the wrong way.
+    """
+    try:
+        with open(path) as fh:
+            value = fh.read().strip()
+    except OSError as exc:
+        return f"{path}=unreadable({exc.strerror})"
+    name = {"0": "SOFT_BLOCKED", "1": "UNBLOCKED", "2": "HARD_BLOCKED"}.get(value)
+    return f"{path}={name if name else repr(value)}"
+
+
 def _silent_hint():
     """What to check when a claimed controller stops answering — the cases a bind cannot explain.
 
@@ -384,18 +400,14 @@ def _silent_hint():
     dongle left wedged by a flood leaked from a previous run. The rfkill state is read live
     because it is the one of those that is visible from inside the container.
     """
-    states = []
-    for path in sorted(glob.glob("/sys/class/bluetooth/hci*/rfkill*/state")):
-        try:
-            with open(path) as fh:
-                states.append(f"{path}={'blocked' if fh.read().strip() == '1' else 'unblocked'}")
-        except OSError:
-            pass
+    states = [_rfkill_state(path)
+              for path in sorted(glob.glob("/sys/class/bluetooth/hci*/rfkill*/state"))]
     return ("The bind succeeded, so hciN is ours and nothing else can be driving it — the "
-            "controller is simply silent. Check `rfkill list` (a soft block leaves it silent), "
-            "that the USB port is not autosuspended, and whether the dongle needs a re-plug; a "
-            "flood leaked by an earlier run wedges it the same way (`pkill -f ble_flood.py`). "
-            f"rfkill: {', '.join(states) if states else 'unreadable'}")
+            "controller is simply silent. Check `rfkill list` (a soft or hard block leaves it "
+            "silent), that the USB port is not autosuspended, and whether the dongle needs a "
+            "re-plug; a flood leaked by an earlier run wedges it the same way "
+            "(`pkill -f ble_flood.py`). "
+            f"rfkill: {', '.join(states) if states else 'no hciN rfkill node'}")
 
 
 def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay=RESET_RETRY_DELAY):
@@ -911,6 +923,19 @@ def selftest():
             raise AssertionError("an unwritable heartbeat path must fail")
         except RuntimeError as exc:
             assert "cannot write" in str(exc), exc
+
+    # The rfkill label goes in the one message a human reads when the controller is silent, and
+    # an inverted one sent a HIL debugging session after a block that was not there. Pin the
+    # kernel ABI (Documentation/ABI/stable/sysfs-class-rfkill) so it cannot flip again.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for value, expected in (("0", "SOFT_BLOCKED"), ("1", "UNBLOCKED"),
+                                ("2", "HARD_BLOCKED"), ("", "''"), ("9", "'9'")):
+            p = os.path.join(tmpdir, "state")
+            with open(p, "w") as fh:
+                fh.write(value + "\n")
+            got = _rfkill_state(p)
+            assert got == f"{p}={expected}", got
+        assert "unreadable" in _rfkill_state(os.path.join(tmpdir, "missing"))
 
     print("selftest OK")
 
