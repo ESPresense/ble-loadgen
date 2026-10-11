@@ -13,16 +13,30 @@ no toolchain — just Python stdlib and a raw HCI socket. Its own image
 
 ## How it runs
 
-As a **detached step in the ESPresense HIL pipeline** (`.woodpecker/hil.yml`): it floods for
-the run and the runner kills it at the end — no host service, no gating.
+As an **ordinary step in the ESPresense HIL pipeline** (`.woodpecker/hil.yml`), running
+alongside the device tests. It floods until a later step creates the `--until` file once the
+tests are done, then stops advertising cleanly. Being a normal step is the point: if the flood
+dies, its own step fails with its own log. A detached step can do neither in Crow.
 
 ```yaml
 - name: ble-flood
   image: ghcr.io/espresense/ble-loadgen:1
-  detach: true
   privileged: true
   network_mode: host          # raw HCI only works in the host netns (see below)
-  # no commands: the image ENTRYPOINT is `python3 ble_flood.py`, CMD supplies --index/--rate
+  depends_on: []
+  volumes: [/var/lock/woodpecker:/lock]
+  temp_volumes: [flood:/flood]
+  commands:
+    # One flood per dongle across concurrent pipelines; the kernel drops the lock when the
+    # process dies, so nothing is left behind. --seconds is a backstop under the repo timeout.
+    - flock -w 18000 /lock/ble-flood.lock python3 /app/ble_flood.py --rate 40 --until /flood/done --seconds 34000
+
+- name: ble-flood-stop
+  image: ghcr.io/espresense/ble-loadgen:1
+  depends_on: [test-esp32, test-esp32c3, test-esp32c6, test-esp32s3]
+  when: [{status: [success, failure]}]
+  temp_volumes: [flood:/flood]
+  commands: [touch /flood/done]
 ```
 
 ## Requirements
@@ -36,7 +50,7 @@ the run and the runner kills it at the end — no host service, no gating.
 
 On `EBUSY` the flood retries for 30s before giving up — busy is usually transient. If it
 still fails, something is holding the adapter: `bluetoothd`
-(`systemctl mask --now bluetooth`) or a leftover detached ble-flood from a previous HIL run
+(`systemctl mask --now bluetooth`) or a leftover ble-flood from a previous HIL run
 (`pkill -f ble_flood.py`). Missing `CAP_NET_ADMIN` or a missing adapter fails immediately
 instead, and the message says which.
 
@@ -144,6 +158,11 @@ can be lost, or answered only once a USB part finishes its firmware setup. The b
 while crow did not. If it still gives up, the message prints the rfkill state and the causes a
 successful bind cannot explain — a soft rfkill block, an autosuspended USB port, a dongle that
 needs a re-plug, or a flood leaked from an earlier run (`pkill -f ble_flood.py`).
+
+Before giving up, the flood re-plugs the dongle once in software (`USBDEVFS_RESET` on the USB
+device behind `hciN`, which needs `--privileged`) and tries again. The bench's Intel controller
+wedged this way and stayed wedged for a dozen runs: the kernel's own reset failed too
+(`hci0: HCI reset during shutdown failed` in `journalctl -k`).
 
 **The bench is running old code.** `:1` and `:1.0` are semver tags: they only move when a `v*`
 git tag is pushed, while `latest`/`sha-*` track `main`. So a fix merged to `main` does *not*

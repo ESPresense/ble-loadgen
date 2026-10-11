@@ -76,16 +76,11 @@ RESET_TIMEOUT = 15.0
 RESET_ATTEMPTS = 3
 RESET_RETRY_DELAY = 1.0
 
-# The HIL runs the flood as a *detached* step, and a detached step cannot fail the pipeline: it
-# can die in its first second and the soak still reports green, having loaded the node with
-# nothing. So the flood publishes liveness to a file that a non-detached guard step reads, and the
-# soak asserts it was still fresh when the run ended. PID 1 in a container, so a file is the only
-# channel that crosses the step boundary.
-HEARTBEAT_FILENAME = "ble-flood.alive"
-HEARTBEAT_INTERVAL = 30.0
-# Identifies this flood process in the heartbeat, so a guard can tell this run's heartbeat from a
-# previous run's that is still young (runs can be back to back). Stable for the process's life.
-_RUN_ID = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+# A controller that never answers HCI_Reset is wedged, and the bench showed it stays wedged across
+# runs: the kernel's own reset fails too, so only a re-plug clears it. A USB reset is that re-plug
+# done in software. _IO('U', 20) from linux/usbdevice_fs.h.
+USBDEVFS_RESET = 0x5514
+PROGRESS_INTERVAL = 30.0  # seconds between progress lines in the log
 # Enough churn to exhaust a node's 100-200 fingerprint slots many times over, small enough
 # that downstream subscribers keyed on the address stay a bounded table. 0 = unbounded.
 DEFAULT_POOL = 4096
@@ -436,108 +431,78 @@ def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay
     raise HciError(f"HCI_Reset never completed in {attempts} attempts: {last}. {_silent_hint()}")
 
 
-def write_heartbeat(path, rotations, rate, address, run=None):
-    """Publish flood liveness atomically, so a reader never catches a half-written file.
+def _usb_node(hci_dir):
+    """The /dev/bus/usb node of the USB device behind ``hci_dir`` (/sys/class/bluetooth/hciN).
 
-    ``run`` identifies the flood process: the guard only accepts a heartbeat whose run differs
-    from the one it saw at startup, so a previous run's still-young heartbeat cannot pass a
-    back-to-back guard. Defaults to this process's start, stable across every write.
-
-    Failing to write is fatal on purpose: a heartbeat the pipeline cannot read is worse than no
-    heartbeat, because the guard would then fail every run and a mount problem would look like a
-    flood problem.
+    hciN/device is the USB *interface*; its parent is the device, which carries busnum/devnum.
     """
-    tmp = f"{path}.tmp"
+    usb = os.path.realpath(os.path.join(hci_dir, "device", ".."))
     try:
-        with open(tmp, "w") as fh:
-            fh.write(f"pid={os.getpid()}\nrun={run or _RUN_ID}\nrotations={rotations}\nrate={rate}\n"
-                     f"last_address={address.hex() if address else ''}\n"
-                     f"updated={time.time():.3f}\n")
-        os.replace(tmp, path)
-    except OSError as exc:
-        raise RuntimeError(f"cannot write flood heartbeat {path}: {exc}") from exc
+        with open(os.path.join(usb, "busnum")) as bus, open(os.path.join(usb, "devnum")) as dev:
+            return f"/dev/bus/usb/{int(bus.read()):03d}/{int(dev.read()):03d}"
+    except (OSError, ValueError) as exc:
+        raise HciError(f"{hci_dir} is not a USB device ({usb}), so it cannot be re-plugged in "
+                       f"software: {exc}") from exc
 
 
-def _read_heartbeat(path):
-    """The parsed heartbeat, or None while it is not there yet."""
-    try:
-        with open(path) as fh:
-            text = fh.read()
-    except OSError:
-        return None
-    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+def usb_reset(index, timeout=BIND_TIMEOUT):
+    """Re-plug the USB dongle behind hciN in software, and wait for hciN to come back.
 
-
-def _heartbeat_age(fields):
-    """Seconds since the flood last refreshed ``fields``, or None if it is unusable."""
-    try:
-        return time.time() - float(fields["updated"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
-    """Fail unless a live flood is refreshing ``path`` — the pipeline's non-detached guard.
-
-    The flood itself cannot fail the build (detached), so the check has to live in a step that
-    can. Waiting catches a flood that never advertised at all; the staleness limit catches one
-    that started and then wedged. Either way the soak has no BLE load, which is worse than a red
-    build: it looks like evidence.
-
-    ``path`` lives on a volume that outlives the pipeline, so a leftover heartbeat from the last
-    run is present but old. Two things keep a leftover from passing this guard: the run id in the
-    heartbeat has to differ from the one seen at startup, and the heartbeat has to be fresh. The
-    run id is what makes it correct for back-to-back runs, where the previous run's heartbeat can
-    still be young when this run's guard starts.
+    btusb has no reset hooks, so the kernel unbinds it, re-enumerates the device and binds it
+    again: hciN goes away and returns with fresh firmware setup. Needs /dev/bus/usb, which a
+    --privileged container has.
     """
-    seen_run = (_read_heartbeat(path) or {}).get("run")
-    deadline = time.monotonic() + wait
-    while True:
-        fields = _read_heartbeat(path)
-        age = _heartbeat_age(fields) if fields else None
-        run = (fields or {}).get("run")
-        if age is not None and age <= stale and (seen_run is None or run != seen_run):
-            break
+    hci_dir = f"/sys/class/bluetooth/hci{index}"
+    node = _usb_node(hci_dir)
+    print(f"[flood] resetting {node} (hci{index}'s USB device)", flush=True)
+    fd = os.open(node, os.O_WRONLY)
+    try:
+        fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+    finally:
+        os.close(fd)
+    # ponytail: a fixed 1s for the old hciN to unregister, then poll for the new one. Watch the
+    # kernel uevents instead if the bench ever shows the old node lingering past that.
+    time.sleep(1.0)
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(hci_dir):
         if time.monotonic() >= deadline:
-            if fields is None:
-                raise HciError(f"no flood heartbeat at {path} within {wait:g}s: the detached flood "
-                               f"never advertised anything, so this run has no BLE load")
-            if age is None:
-                raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
-            if seen_run is not None and run == seen_run:
-                raise HciError(f"flood heartbeat {path} is still the previous run's (run "
-                               f"{run}) after waiting {wait:g}s: this run's flood never wrote one, "
-                               f"so the soak has no BLE load")
-            raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s) after "
-                           f"waiting {wait:g}s: a leftover from a previous run, and this run's "
-                           f"flood never refreshed it, so the soak has no BLE load")
-        time.sleep(poll)
-
-    stop = time.monotonic() + watch
-    while True:
-        fields = _read_heartbeat(path) or {}
-        age = _heartbeat_age(fields)
-        if age is None:
-            raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
-        if age > stale:
-            raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s): the "
-                           f"flood stopped after {fields.get('rotations')} rotations")
-        if time.monotonic() >= stop:
-            print(f"[flood] heartbeat OK: {age:.1f}s old, {fields.get('rotations')} rotations",
-                  flush=True)
-            return
-        time.sleep(poll)
+            raise HciError(f"hci{index} did not come back within {timeout:g}s of the USB reset")
+        time.sleep(0.5)
 
 
-def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
+def claim(index):
+    """Open hciN and reset it, re-plugging the dongle once if the controller is wedged.
+
+    A wedged controller does not recover between runs on its own (the bench went a dozen runs
+    without load that way), so a silent HCI_Reset gets one USB reset before it is fatal.
+    """
+    sock = open_adapter(index)
+    try:
+        reset_controller(sock)
+        return sock
+    except HciError as exc:
+        sock.close()
+        print(f"[flood] {exc}", flush=True)
+    usb_reset(index)
+    sock = open_adapter(index)
+    try:
+        reset_controller(sock)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def flood(sock, rate, stop_after, until=None, pool_size=DEFAULT_POOL,
           beacon_count=IBEACON_COUNT, beacon_period=IBEACON_PERIOD):
-    """Rotate the advertised address forever (or until time runs out).
+    """Rotate the advertised address until ``until`` exists or time runs out (else forever).
 
     Addresses come from a pool of pool_size and repeat once it wraps; pool_size=0 mints a
     fresh one every rotation (unbounded -- see address_pool for what that costs downstream).
 
-    Lifetime is the process's: the HIL pipeline runs this as a detached step, so the flood
-    starts with the run and the runner kills it when the run ends. No external gating.
+    ``sock`` must be claimed and reset (see claim). The HIL runs this as an ordinary step and
+    ends it by creating ``until`` once the tests are done, so it stops advertising cleanly instead
+    of being killed mid-command, and a flood that dies early fails its own step.
 
     Order matters: the controller rejects LE Set Random Address while advertising is
     enabled, so each rotation is disable -> re-address -> enable.
@@ -553,13 +518,8 @@ def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
         print(f"[flood] ibeacon {index} mac {address[::-1].hex()} major {index + 1}", flush=True)
     announced = {}  # beacon index -> last phase logged, so each UUID change is logged once
 
-    reset_controller(sock)
     time.sleep(0.1)
     send(sock, OCF_LE_SET_ADV_PARAMETERS, adv_parameters())
-    # Advertise-ready is the moment the guard cares about: from here the node is being loaded.
-    # Every later refresh only says the flood is still going.
-    if heartbeat:
-        write_heartbeat(heartbeat, 0, rate, b"")
 
     interval = 1.0 / rate
     started = time.monotonic()
@@ -568,6 +528,9 @@ def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
 
     while True:
         if stop_after and time.monotonic() - started >= stop_after:
+            break
+        if until and os.path.exists(until):
+            print(f"[flood] {until} appeared, stopping", flush=True)
             break
 
         cycle = time.monotonic()
@@ -583,12 +546,10 @@ def flood(sock, rate, stop_after, heartbeat=None, pool_size=DEFAULT_POOL,
         rotations += 1
 
         now = time.monotonic()
-        if now - reported >= HEARTBEAT_INTERVAL:
+        if now - reported >= PROGRESS_INTERVAL:
             print(f"[flood] {rotations} rotations over {len(pool) if pool else rotations} "
                   f"addresses in {now - started:.0f}s "
                   f"({rotations / (now - started):.1f}/s)", flush=True)
-            if heartbeat:
-                write_heartbeat(heartbeat, rotations, rate, address)
             reported = now
         time.sleep(max(0.0, interval - (now - cycle)))
 
@@ -815,114 +776,27 @@ def selftest():
         assert "nothing arrived at all" in str(exc), exc
     quiet.close()
 
-    # The guard decides whether a dead flood is allowed to look like a passing run, so all three
-    # outcomes are pinned here: fresh passes, stale fails, absent fails. No hardware involved.
     import tempfile
 
+    # The USB reset is the bench's only way out of a wedged controller, so the sysfs walk to the
+    # device node is pinned against a fake tree shaped like the real one (hci0/device is the
+    # interface, its parent the device).
     with tempfile.TemporaryDirectory() as tmpdir:
-        hb = os.path.join(tmpdir, HEARTBEAT_FILENAME)
-
-        # Happy path: the guard starts with no heartbeat (the flood removes any leftover before it
-        # claims the adapter), then this run's flood writes one. The guard only accepts a heartbeat
-        # whose run differs from what it saw at startup.
-        first = threading.Thread(
-            target=lambda: (time.sleep(0.05), write_heartbeat(hb, 1234, 40.0,
-                                                              bytes.fromhex("aabbccddeeff"),
-                                                              run="run-this")),
-            daemon=True)
-        first.start()
-        check_heartbeat(hb, wait=5, stale=60, watch=0, poll=0.02)
-        first.join()
-        fields = _read_heartbeat(hb)
-        assert fields["rotations"] == "1234" and fields["rate"] == "40.0", fields
-        assert fields["last_address"] == "aabbccddeeff", fields
-        assert abs(time.time() - float(fields["updated"])) < 5, fields
-        # The writer replaces atomically, so a reader must never see the temp file left behind.
-        assert not os.path.exists(f"{hb}.tmp"), "temp file left behind"
-
-        # Stale: the flood started and then stopped refreshing — the soak has no load. There is
-        # no refresh during the wait, so the guard times out on the fresh-heartbeat wait.
-        with open(hb, "w") as fh:
-            fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
+        usb = os.path.join(tmpdir, "usb1", "1-7")
+        os.makedirs(os.path.join(usb, "1-7:1.0"))
+        for name, value in (("busnum", "1\n"), ("devnum", "6\n")):
+            with open(os.path.join(usb, name), "w") as fh:
+                fh.write(value)
+        hci = os.path.join(tmpdir, "hci0")
+        os.makedirs(hci)
+        os.symlink(os.path.join(usb, "1-7:1.0"), os.path.join(hci, "device"))
+        assert _usb_node(hci) == "/dev/bus/usb/001/006", _usb_node(hci)
+        os.remove(os.path.join(usb, "devnum"))
         try:
-            check_heartbeat(hb, wait=0.1, stale=90, watch=0, poll=0.02)
-            raise AssertionError("a stale heartbeat must fail the guard")
+            _usb_node(hci)
+            raise AssertionError("a non-USB adapter must say why it cannot be re-plugged")
         except HciError as exc:
-            assert "600s old" in str(exc) and "leftover" in str(exc), exc
-
-        # A leftover heartbeat from a previous run must not fail the guard the instant it runs:
-        # the volume outlives the pipeline, so the guard has to wait for the new flood to refresh
-        # it. This is the bug that failed ble-flood-guard on every run. The leftover has no run id
-        # (an older format), so a fresh write from any run is accepted.
-        with open(hb, "w") as fh:
-            fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
-        refresher = threading.Thread(
-            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 7, 40.0, b"", run="run-new")),
-            daemon=True)
-        refresher.start()
-        check_heartbeat(hb, wait=5, stale=90, watch=0, poll=0.02)
-        refresher.join()
-
-        # Back-to-back runs: the previous run's heartbeat can still be young when this run's guard
-        # starts. Run identity is what rejects it, not freshness alone.
-        write_heartbeat(hb, 500, 40.0, b"", run="run-previous")
-        try:
-            check_heartbeat(hb, wait=0.15, stale=90, watch=0, poll=0.02)
-            raise AssertionError("a young heartbeat from the previous run must fail")
-        except HciError as exc:
-            assert "previous run's" in str(exc) and "run-previous" in str(exc), exc
-
-        # ...and the new run's own heartbeat, even while the old one is still fresh, passes.
-        write_heartbeat(hb, 500, 40.0, b"", run="run-previous")
-        runs_forward = threading.Thread(
-            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 1, 40.0, b"", run="run-current")),
-            daemon=True)
-        runs_forward.start()
-        check_heartbeat(hb, wait=5, stale=90, watch=0, poll=0.02)
-        runs_forward.join()
-
-        # Once this run's heartbeat is seen, the watch phase keeps refreshing it and passes.
-        write_heartbeat(hb, 8, 40.0, b"", run="run-watched-old")
-        stale_watcher = threading.Thread(
-            target=lambda: (time.sleep(0.15), write_heartbeat(hb, 9, 40.0, b"", run="run-watched")),
-            daemon=True)
-        stale_watcher.start()
-        check_heartbeat(hb, wait=5, stale=90, watch=1, poll=0.02)
-        stale_watcher.join()
-
-        # A heartbeat that goes stale during the watch window must fail then, not at the wait.
-        write_heartbeat(hb, 11, 40.0, b"", run="run-before-wedge")
-
-        def _wedge_mid_watch():
-            time.sleep(0.1)
-            write_heartbeat(hb, 11, 40.0, b"", run="run-wedge")  # this run, fresh: enters the watch
-            time.sleep(0.15)
-            with open(hb, "w") as fh:
-                fh.write(f"rotations=12\nupdated={time.time() - 200:.3f}\n")  # then wedges
-
-        wedger = threading.Thread(target=_wedge_mid_watch, daemon=True)
-        wedger.start()
-        try:
-            check_heartbeat(hb, wait=5, stale=90, watch=2, poll=0.02)
-            raise AssertionError("a heartbeat that wedges mid-watch must fail")
-        except HciError as exc:
-            assert "stopped after 12 rotations" in str(exc), exc
-        wedger.join()
-
-        # Absent: the flood never advertised at all — the bench failure that went unnoticed.
-        try:
-            check_heartbeat(os.path.join(tmpdir, "never-created"), wait=0.1, stale=90,
-                            watch=0, poll=0.02)
-            raise AssertionError("a missing heartbeat must fail the guard")
-        except HciError as exc:
-            assert "no flood heartbeat" in str(exc), exc
-
-        # An unwritable heartbeat path has to be fatal at startup, not a silent no-op.
-        try:
-            write_heartbeat(os.path.join(tmpdir, "missing-dir", HEARTBEAT_FILENAME), 0, 40.0, b"")
-            raise AssertionError("an unwritable heartbeat path must fail")
-        except RuntimeError as exc:
-            assert "cannot write" in str(exc), exc
+            assert "not a USB device" in str(exc), exc
 
     # The rfkill label goes in the one message a human reads when the controller is silent, and
     # an inverted one sent a HIL debugging session after a block that was not there. Pin the
@@ -955,24 +829,12 @@ def main():
     p.add_argument("--ibeacon-period", type=float, default=IBEACON_PERIOD,
                    help=f"seconds before a beacon's UUID changes (default {IBEACON_PERIOD:g})")
     p.add_argument("--selftest", action="store_true", help="verify framing, no hardware")
-    p.add_argument("--heartbeat", metavar="PATH",
-                   help="publish liveness here (default: $BLE_FLOOD_HEARTBEAT), so a guard step "
-                        "can see a detached flood that never started")
-    p.add_argument("--check-heartbeat", metavar="PATH",
-                   help="guard mode: fail unless a live flood is refreshing PATH")
-    p.add_argument("--wait", type=float, default=120.0,
-                   help="guard mode: seconds to wait for the heartbeat to appear")
-    p.add_argument("--stale", type=float, default=90.0,
-                   help="guard mode: fail once the heartbeat is older than this")
-    p.add_argument("--watch", type=float, default=0.0,
-                   help="guard mode: keep checking for this long before succeeding")
+    p.add_argument("--until", metavar="PATH",
+                   help="stop cleanly once PATH exists (how the HIL ends the flood)")
     args = p.parse_args()
 
     if args.selftest:
         selftest()
-        return
-    if args.check_heartbeat:
-        check_heartbeat(args.check_heartbeat, args.wait, args.stale, args.watch)
         return
     if args.rate <= 0:
         p.error("--rate must be positive")
@@ -991,28 +853,22 @@ def main():
     except ValueError as exc:
         p.error(str(exc))
 
-    heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
-    if heartbeat:
-        # The volume that holds this file outlives the pipeline, and the flood writes it only
-        # after resetting the controller. Drop any leftover from a previous run first, so a
-        # guard racing this flood can never mistake the old run's heartbeat for this one's.
-        try:
-            os.remove(heartbeat)
-        except FileNotFoundError:
-            pass
-        print(f"[flood] heartbeat -> {heartbeat}", flush=True)
+    # The flood can wait a long time for the bench lock (another pipeline's flood), and the tests
+    # it was meant to load may be done by then. Claiming the adapter just to stop is pointless.
+    if args.until and os.path.exists(args.until):
+        print(f"[flood] {args.until} already exists, nothing to load", flush=True)
+        return
 
-    # The HIL runs this as a detached step, so it's PID 1 in its container and the runner stops
-    # it with SIGTERM (docker stop). The kernel ignores un-handled signals for PID 1, so without
+    # In a container this is PID 1, and a runner stops it with SIGTERM (docker stop). The kernel ignores un-handled signals for PID 1, so without
     # this the flood outlives the run, keeps hci0, and the next run's bind() fails EBUSY (and its
     # node sees a flood it never asked for). Route SIGTERM through the same KeyboardInterrupt path
     # that disables advertising and releases the adapter cleanly.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
 
-    sock = open_adapter(args.index)
+    sock = claim(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
     try:
-        flood(sock, args.rate, args.seconds, heartbeat or None, pool_size, beacon_count, args.ibeacon_period)
+        flood(sock, args.rate, args.seconds, args.until, pool_size, beacon_count, args.ibeacon_period)
     except KeyboardInterrupt:
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
         print("[flood] stopped on signal", flush=True)
