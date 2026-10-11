@@ -449,27 +449,50 @@ def _read_heartbeat(path):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
+def _heartbeat_age(fields):
+    """Seconds since the flood last refreshed ``fields``, or None if it is unusable."""
+    try:
+        return time.time() - float(fields["updated"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
     """Fail unless a live flood is refreshing ``path`` — the pipeline's non-detached guard.
 
     The flood itself cannot fail the build (detached), so the check has to live in a step that
-    can. Waiting for the file catches a flood that never advertised at all; the staleness limit
-    catches one that started and then wedged. Either way the soak has no BLE load, which is worse
-    than a red build: it looks like evidence.
+    can. Waiting catches a flood that never advertised at all; the staleness limit catches one
+    that started and then wedged. Either way the soak has no BLE load, which is worse than a red
+    build: it looks like evidence.
+
+    ``path`` lives on a volume that outlives the pipeline, so a leftover heartbeat from the last
+    run is present but old. Waiting for the file alone would let that stale file fail the guard
+    the instant it runs, racing the new flood's first write. So the wait phase requires a
+    heartbeat that is not just present but fresh; only a genuinely absent-or-stale heartbeat for
+    the whole wait window is a failure.
     """
     deadline = time.monotonic() + wait
-    while _read_heartbeat(path) is None:
+    while True:
+        fields = _read_heartbeat(path)
+        age = _heartbeat_age(fields) if fields else None
+        if age is not None and age <= stale:
+            break
         if time.monotonic() >= deadline:
-            raise HciError(f"no flood heartbeat at {path} within {wait:g}s: the detached flood "
-                           f"never advertised anything, so this run has no BLE load")
+            if fields is None:
+                raise HciError(f"no flood heartbeat at {path} within {wait:g}s: the detached flood "
+                               f"never advertised anything, so this run has no BLE load")
+            if age is None:
+                raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
+            raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s) after "
+                           f"waiting {wait:g}s: a leftover from a previous run, and this run's "
+                           f"flood never refreshed it, so the soak has no BLE load")
         time.sleep(poll)
 
     stop = time.monotonic() + watch
     while True:
         fields = _read_heartbeat(path) or {}
-        try:
-            age = time.time() - float(fields["updated"])
-        except (KeyError, ValueError):
+        age = _heartbeat_age(fields)
+        if age is None:
             raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
         if age > stale:
             raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s): the "
@@ -782,18 +805,55 @@ def selftest():
         assert not os.path.exists(f"{hb}.tmp"), "temp file left behind"
         check_heartbeat(hb, wait=0.05, stale=60, watch=0, poll=0.02)
 
-        # Stale: the flood started and then stopped refreshing — the soak has no load.
+        # Stale: the flood started and then stopped refreshing — the soak has no load. There is
+        # no refresh during the wait, so the guard times out on the fresh-heartbeat wait.
         with open(hb, "w") as fh:
             fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
         try:
-            check_heartbeat(hb, wait=0.05, stale=90, watch=0, poll=0.02)
+            check_heartbeat(hb, wait=0.1, stale=90, watch=0, poll=0.02)
             raise AssertionError("a stale heartbeat must fail the guard")
         except HciError as exc:
-            assert "600s old" in str(exc) and "99 rotations" in str(exc), exc
+            assert "600s old" in str(exc) and "leftover" in str(exc), exc
+
+        # A leftover heartbeat from a previous run must not fail the guard the instant it runs:
+        # the volume outlives the pipeline, so the guard has to wait for the new flood to refresh
+        # it. This is the bug that failed ble-flood-guard on every run.
+        with open(hb, "w") as fh:
+            fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
+        refresher = threading.Thread(
+            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 7, 40.0, b"")), daemon=True)
+        refresher.start()
+        check_heartbeat(hb, wait=5, stale=90, watch=0, poll=0.02)
+        refresher.join()
+
+        # Once a fresh heartbeat is seen, the watch phase still fails it going stale mid-run.
+        write_heartbeat(hb, 8, 40.0, b"")
+        stale_watcher = threading.Thread(
+            target=lambda: (time.sleep(0.15), write_heartbeat(hb, 9, 40.0, b"")), daemon=True)
+        stale_watcher.start()
+        check_heartbeat(hb, wait=5, stale=90, watch=1, poll=0.02)
+        stale_watcher.join()
+
+        # A heartbeat that goes stale during the watch window must fail then, not at the wait.
+        write_heartbeat(hb, 11, 40.0, b"")
+
+        def _let_it_wedge():
+            time.sleep(0.15)
+            with open(hb, "w") as fh:
+                fh.write(f"rotations=12\nupdated={time.time() - 200:.3f}\n")
+
+        wedger = threading.Thread(target=_let_it_wedge, daemon=True)
+        wedger.start()
+        try:
+            check_heartbeat(hb, wait=0.05, stale=90, watch=2, poll=0.02)
+            raise AssertionError("a heartbeat that wedges mid-watch must fail")
+        except HciError as exc:
+            assert "stopped after 12 rotations" in str(exc), exc
+        wedger.join()
 
         # Absent: the flood never advertised at all — the bench failure that went unnoticed.
         try:
-            check_heartbeat(os.path.join(tmpdir, "never-created"), wait=0.05, stale=90,
+            check_heartbeat(os.path.join(tmpdir, "never-created"), wait=0.1, stale=90,
                             watch=0, poll=0.02)
             raise AssertionError("a missing heartbeat must fail the guard")
         except HciError as exc:
@@ -862,6 +922,13 @@ def main():
 
     heartbeat = args.heartbeat or os.environ.get("BLE_FLOOD_HEARTBEAT", "")
     if heartbeat:
+        # The volume that holds this file outlives the pipeline, and the flood writes it only
+        # after resetting the controller. Drop any leftover from a previous run first, so a
+        # guard racing this flood can never mistake the old run's heartbeat for this one's.
+        try:
+            os.remove(heartbeat)
+        except FileNotFoundError:
+            pass
         print(f"[flood] heartbeat -> {heartbeat}", flush=True)
 
     # The HIL runs this as a detached step, so it's PID 1 in its container and the runner stops
