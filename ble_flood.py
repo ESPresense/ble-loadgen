@@ -384,18 +384,50 @@ def _silent_hint():
     dongle left wedged by a flood leaked from a previous run. The rfkill state is read live
     because it is the one of those that is visible from inside the container.
     """
-    states = []
-    for path in sorted(glob.glob("/sys/class/bluetooth/hci*/rfkill*/state")):
-        try:
-            with open(path) as fh:
-                states.append(f"{path}={'blocked' if fh.read().strip() == '1' else 'unblocked'}")
-        except OSError:
-            pass
+    states = [f"{path}={'blocked' if blocked else 'unblocked'}" for path, blocked in _rfkill_states()]
     return ("The bind succeeded, so hciN is ours and nothing else can be driving it — the "
             "controller is simply silent. Check `rfkill list` (a soft block leaves it silent), "
             "that the USB port is not autosuspended, and whether the dongle needs a re-plug; a "
             "flood leaked by an earlier run wedges it the same way (`pkill -f ble_flood.py`). "
             f"rfkill: {', '.join(states) if states else 'unreadable'}")
+
+
+def _rfkill_states(index=None, root="/sys/class/bluetooth"):
+    """(path, blocked) for hciN rfkill switches, sorted; all of them when index is None.
+
+    A switch lives under /sys/class/bluetooth/hciN/rfkillM/state and M is not N, so the adapter is
+    matched on the hciN directory, not on a guessed rfkill number. ``root`` is overridable so the
+    selftest can point it at a fake tree.
+    """
+    pattern = f"{root}/hci{index}/rfkill*/state" if index is not None else f"{root}/hci*/rfkill*/state"
+    out = []
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path) as fh:
+                out.append((path, fh.read().strip() == "1"))
+        except OSError:
+            pass
+    return out
+
+
+def unblock_rfkill(index, root="/sys/class/bluetooth"):
+    """Clear a soft rfkill block on hciN before we claim it, and say if we cannot.
+
+    A soft block leaves the controller silent: the bind still succeeds, so the failure looks like
+    a dead dongle, but every command goes unanswered and HCI_Reset gives up after 45s. The bench
+    has been left in this state by a previous run; the flood is privileged, so it can clear it
+    itself. Writing 1 back is not our business, so we only ever unblock, and only our adapter.
+    """
+    for path, blocked in _rfkill_states(index, root):
+        if not blocked:
+            continue
+        try:
+            with open(path, "w") as fh:
+                fh.write("0\n")
+            print(f"[flood] hci{index} was rfkill-blocked; unblocked it ({path})", flush=True)
+        except OSError as exc:
+            print(f"[flood] hci{index} is rfkill-blocked and could not be unblocked: {exc}",
+                  flush=True)
 
 
 def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay=RESET_RETRY_DELAY):
@@ -912,6 +944,26 @@ def selftest():
         except RuntimeError as exc:
             assert "cannot write" in str(exc), exc
 
+    # rfkill: a soft block on hciN is what left the bench silent, so the flood clears it. The switch
+    # is under hciN/rfkillM and M is not N, so a guessed path would miss it.
+    with tempfile.TemporaryDirectory() as root:
+        for hci, rfk, state in (("0", "1", "1"), ("1", "0", "0"), ("2", "5", "1")):
+            d = os.path.join(root, f"hci{hci}", f"rfkill{rfk}")
+            os.makedirs(d)
+            with open(os.path.join(d, "state"), "w") as fh:
+                fh.write(state + "\n")
+
+        assert dict(_rfkill_states(0, root))[os.path.join(root, "hci0", "rfkill1", "state")] is True
+        unblock_rfkill(0, root)
+        with open(os.path.join(root, "hci0", "rfkill1", "state")) as fh:
+            assert fh.read().strip() == "0", "hci0's block must be cleared"
+        # An unblocked adapter and a different adapter's block are left alone.
+        assert _rfkill_states(1, root) == [(os.path.join(root, "hci1", "rfkill0", "state"), False)]
+        assert _rfkill_states(2, root)[0][1] is True, "hci2 must stay blocked"
+
+        # A missing switch is not an error (no rfkill node, or /sys not mounted).
+        unblock_rfkill(9, root)
+
     print("selftest OK")
 
 
@@ -986,6 +1038,9 @@ def main():
 
     sock = open_adapter(args.index)
     print(f"[flood] hci{args.index} claimed, rotating at {args.rate}/s", flush=True)
+    # A soft rfkill block survives on the bench between runs and leaves the controller silent while
+    # still allowing the bind, so clear it before the first command rather than after 45s of reset.
+    unblock_rfkill(args.index)
     try:
         flood(sock, args.rate, args.seconds, heartbeat or None, pool_size, beacon_count, args.ibeacon_period)
     except KeyboardInterrupt:
