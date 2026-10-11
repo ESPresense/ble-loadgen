@@ -83,9 +83,6 @@ RESET_RETRY_DELAY = 1.0
 # channel that crosses the step boundary.
 HEARTBEAT_FILENAME = "ble-flood.alive"
 HEARTBEAT_INTERVAL = 30.0
-# Identifies this flood process in the heartbeat, so a guard can tell this run's heartbeat from a
-# previous run's that is still young (runs can be back to back). Stable for the process's life.
-_RUN_ID = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
 # Enough churn to exhaust a node's 100-200 fingerprint slots many times over, small enough
 # that downstream subscribers keyed on the address stay a bounded table. 0 = unbounded.
 DEFAULT_POOL = 4096
@@ -424,12 +421,8 @@ def reset_controller(sock, timeout=RESET_TIMEOUT, attempts=RESET_ATTEMPTS, delay
     raise HciError(f"HCI_Reset never completed in {attempts} attempts: {last}. {_silent_hint()}")
 
 
-def write_heartbeat(path, rotations, rate, address, run=None):
+def write_heartbeat(path, rotations, rate, address):
     """Publish flood liveness atomically, so a reader never catches a half-written file.
-
-    ``run`` identifies the flood process: the guard only accepts a heartbeat whose run differs
-    from the one it saw at startup, so a previous run's still-young heartbeat cannot pass a
-    back-to-back guard. Defaults to this process's start, stable across every write.
 
     Failing to write is fatal on purpose: a heartbeat the pipeline cannot read is worse than no
     heartbeat, because the guard would then fail every run and a mount problem would look like a
@@ -438,7 +431,7 @@ def write_heartbeat(path, rotations, rate, address, run=None):
     tmp = f"{path}.tmp"
     try:
         with open(tmp, "w") as fh:
-            fh.write(f"pid={os.getpid()}\nrun={run or _RUN_ID}\nrotations={rotations}\nrate={rate}\n"
+            fh.write(f"pid={os.getpid()}\nrotations={rotations}\nrate={rate}\n"
                      f"last_address={address.hex() if address else ''}\n"
                      f"updated={time.time():.3f}\n")
         os.replace(tmp, path)
@@ -473,18 +466,17 @@ def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
     build: it looks like evidence.
 
     ``path`` lives on a volume that outlives the pipeline, so a leftover heartbeat from the last
-    run is present but old. Two things keep a leftover from passing this guard: the run id in the
-    heartbeat has to differ from the one seen at startup, and the heartbeat has to be fresh. The
-    run id is what makes it correct for back-to-back runs, where the previous run's heartbeat can
-    still be young when this run's guard starts.
+    run is present, and after back-to-back runs it can still be young. So the guard only accepts a
+    heartbeat that is fresh and has changed since it started: a dead flood never rewrites its
+    file, a live one does every HEARTBEAT_INTERVAL. That holds whichever of the guard and this
+    run's flood gets to the file first, at the cost of waiting up to one interval.
     """
-    seen_run = (_read_heartbeat(path) or {}).get("run")
+    seen = (_read_heartbeat(path) or {}).get("updated")
     deadline = time.monotonic() + wait
     while True:
         fields = _read_heartbeat(path)
         age = _heartbeat_age(fields) if fields else None
-        run = (fields or {}).get("run")
-        if age is not None and age <= stale and (seen_run is None or run != seen_run):
+        if age is not None and age <= stale and fields.get("updated") != seen:
             break
         if time.monotonic() >= deadline:
             if fields is None:
@@ -492,9 +484,9 @@ def check_heartbeat(path, wait, stale, watch=0.0, poll=1.0):
                                f"never advertised anything, so this run has no BLE load")
             if age is None:
                 raise HciError(f"unreadable flood heartbeat at {path}: {fields or 'empty'}")
-            if seen_run is not None and run == seen_run:
-                raise HciError(f"flood heartbeat {path} is still the previous run's (run "
-                               f"{run}) after waiting {wait:g}s: this run's flood never wrote one, "
+            if age <= stale:
+                raise HciError(f"flood heartbeat {path} has not changed in {wait:g}s: it is the "
+                               f"previous run's, or this run's flood stopped before refreshing it, "
                                f"so the soak has no BLE load")
             raise HciError(f"flood heartbeat {path} is {age:.0f}s old (limit {stale:g}s) after "
                            f"waiting {wait:g}s: a leftover from a previous run, and this run's "
@@ -811,12 +803,10 @@ def selftest():
         hb = os.path.join(tmpdir, HEARTBEAT_FILENAME)
 
         # Happy path: the guard starts with no heartbeat (the flood removes any leftover before it
-        # claims the adapter), then this run's flood writes one. The guard only accepts a heartbeat
-        # whose run differs from what it saw at startup.
+        # claims the adapter), then this run's flood writes one.
         first = threading.Thread(
             target=lambda: (time.sleep(0.05), write_heartbeat(hb, 1234, 40.0,
-                                                              bytes.fromhex("aabbccddeeff"),
-                                                              run="run-this")),
+                                                              bytes.fromhex("aabbccddeeff"))),
             daemon=True)
         first.start()
         check_heartbeat(hb, wait=5, stale=60, watch=0, poll=0.02)
@@ -840,50 +830,50 @@ def selftest():
 
         # A leftover heartbeat from a previous run must not fail the guard the instant it runs:
         # the volume outlives the pipeline, so the guard has to wait for the new flood to refresh
-        # it. This is the bug that failed ble-flood-guard on every run. The leftover has no run id
-        # (an older format), so a fresh write from any run is accepted.
+        # it. This is the bug that failed ble-flood-guard on every run.
         with open(hb, "w") as fh:
             fh.write(f"rotations=99\nupdated={time.time() - 600:.3f}\n")
         refresher = threading.Thread(
-            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 7, 40.0, b"", run="run-new")),
+            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 7, 40.0, b"")),
             daemon=True)
         refresher.start()
         check_heartbeat(hb, wait=5, stale=90, watch=0, poll=0.02)
         refresher.join()
 
         # Back-to-back runs: the previous run's heartbeat can still be young when this run's guard
-        # starts. Run identity is what rejects it, not freshness alone.
-        write_heartbeat(hb, 500, 40.0, b"", run="run-previous")
+        # starts. A heartbeat that never changes is rejected, not accepted for being young.
+        write_heartbeat(hb, 500, 40.0, b"")
         try:
             check_heartbeat(hb, wait=0.15, stale=90, watch=0, poll=0.02)
             raise AssertionError("a young heartbeat from the previous run must fail")
         except HciError as exc:
-            assert "previous run's" in str(exc) and "run-previous" in str(exc), exc
+            assert "has not changed" in str(exc) and "previous run's" in str(exc), exc
 
-        # ...and the new run's own heartbeat, even while the old one is still fresh, passes.
-        write_heartbeat(hb, 500, 40.0, b"", run="run-previous")
+        # ...and a refresh passes. This is also the case where this run's flood wrote its first
+        # heartbeat before the guard started: the guard must wait for the next one, not reject it.
+        write_heartbeat(hb, 500, 40.0, b"")
         runs_forward = threading.Thread(
-            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 1, 40.0, b"", run="run-current")),
+            target=lambda: (time.sleep(0.1), write_heartbeat(hb, 1, 40.0, b"")),
             daemon=True)
         runs_forward.start()
         check_heartbeat(hb, wait=5, stale=90, watch=0, poll=0.02)
         runs_forward.join()
 
         # Once this run's heartbeat is seen, the watch phase keeps refreshing it and passes.
-        write_heartbeat(hb, 8, 40.0, b"", run="run-watched-old")
+        write_heartbeat(hb, 8, 40.0, b"")
         stale_watcher = threading.Thread(
-            target=lambda: (time.sleep(0.15), write_heartbeat(hb, 9, 40.0, b"", run="run-watched")),
+            target=lambda: (time.sleep(0.15), write_heartbeat(hb, 9, 40.0, b"")),
             daemon=True)
         stale_watcher.start()
         check_heartbeat(hb, wait=5, stale=90, watch=1, poll=0.02)
         stale_watcher.join()
 
         # A heartbeat that goes stale during the watch window must fail then, not at the wait.
-        write_heartbeat(hb, 11, 40.0, b"", run="run-before-wedge")
+        write_heartbeat(hb, 11, 40.0, b"")
 
         def _wedge_mid_watch():
             time.sleep(0.1)
-            write_heartbeat(hb, 11, 40.0, b"", run="run-wedge")  # this run, fresh: enters the watch
+            write_heartbeat(hb, 11, 40.0, b"")  # this run, fresh: enters the watch
             time.sleep(0.15)
             with open(hb, "w") as fh:
                 fh.write(f"rotations=12\nupdated={time.time() - 200:.3f}\n")  # then wedges
