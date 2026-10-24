@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flood the bench with BLE advertisements, rotating through a pool of random addresses.
+"""Flood the bench with BLE advertisements, rotating through a fixed pool of addresses.
 
 Why: ESPresense fingerprints a *static random* address by MAC (BleFingerprint.cpp,
 ID_TYPE_RAND_STATIC_MAC when the top two bits of the MSB are set), so every rotation
@@ -15,9 +15,9 @@ other process has powered up.
 Runs as a detached step in the HIL pipeline (.woodpecker/hil.yml), so it floods for the
 run and the runner stops it at the end — no external gating.
 
-By default the addresses come from a pool of 4096 and repeat once it wraps. The node still
+By default the addresses are the fixed set f1:ad:00:00:00:00 to f1:ad:00:00:03:ff and repeat once they wrap. The node still
 sees a new MAC every rotation, but subscribers that key off the address (ESPresense Companion
--> MQTT discovery -> a Home Assistant device_tracker each, BlueZ's own cache) stop at 4096
+-> MQTT discovery -> a Home Assistant device_tracker each, BlueZ's own cache) stop at 1024
 rows instead of growing for as long as the flood runs. --pool 0 restores unbounded minting.
 
   ble_flood.py --index 0 --rate 40   # flood until killed
@@ -83,7 +83,12 @@ USBDEVFS_RESET = 0x5514
 PROGRESS_INTERVAL = 30.0  # seconds between progress lines in the log
 # Enough churn to exhaust a node's 100-200 fingerprint slots many times over, small enough
 # that downstream subscribers keyed on the address stay a bounded table. 0 = unbounded.
-DEFAULT_POOL = 4096
+DEFAULT_POOL = 1024
+# Pool addresses are f1:ad:00:<index>, the same set on every run. A run that minted a fresh
+# random pool still left --pool new rows downstream per pipeline; a fixed set is reused instead.
+# f1 has the top two bits set (static random), and the prefix mirrors LOADGEN_UUID_PREFIX so
+# consumers can drop the flood's addresses the same way they drop its beacons.
+POOL_PREFIX = bytes.fromhex("f1ad00")
 
 # iBeacon adverts for the bench. A real beacon keeps its MAC but changes its proximity UUID while
 # moving (BlueCharm BC04P, ESPresense#2492), and ESPresense must track each UUID as its own
@@ -139,11 +144,13 @@ def address_pool(size):
     left 53k orphaned HA entities behind. A pool keeps the node's fingerprint churn identical
     -- it still sees a new MAC every rotation until the pool wraps -- while the downstream
     row count stops at len(pool).
+
+    The set is the same on every run (f1:ad:00:00:00:00 upwards), so those rows are reused
+    across runs rather than minted anew. Little-endian on the wire: the index comes first.
     """
-    pool = set()
-    while len(pool) < size:
-        pool.add(random_static_address())
-    return sorted(pool)
+    if size > 1 << 24:
+        raise ValueError(f"pool must fit in the 3 index bytes, got {size}")
+    return [index.to_bytes(3, "little") + POOL_PREFIX[::-1] for index in range(size)]
 
 
 def random_static_address():
@@ -512,7 +519,7 @@ def flood(sock, rate, stop_after, until=None, pool_size=DEFAULT_POOL,
     validate_period(beacon_period)
     pool = address_pool(pool_size) if pool_size else None
     if pool:
-        print(f"[flood] cycling a pool of {len(pool)} addresses", flush=True)
+        print(f"[flood] cycling a pool of {len(pool)} addresses, {pool[0][::-1].hex()}..{pool[-1][::-1].hex()}", flush=True)
     beacons = [random_static_address() for _ in range(beacon_count)]
     for index, address in enumerate(beacons):
         print(f"[flood] ibeacon {index} mac {address[::-1].hex()} major {index + 1}", flush=True)
@@ -585,7 +592,10 @@ def selftest():
         assert len(addr) == 6 and addr[5] & 0xC0 == 0xC0, addr.hex()
     assert [pool[n % len(pool)] for n in (0, 255, 256, 257)] == [
         pool[0], pool[255], pool[0], pool[1]], "pool must wrap"
-    assert address_pool(1) != address_pool(1), "pools must not be a fixed sequence"
+    # A fixed set: the same addresses on every run, so downstream rows are reused, not minted.
+    assert address_pool(256) == pool, "pool must be the same every run"
+    assert pool[0][::-1].hex() == "f1ad00000000" and pool[255][::-1].hex() == "f1ad000000ff", pool[0].hex()
+    assert address_pool(257)[256][::-1].hex() == "f1ad00000100"
 
     # $BLE_FLOOD_POOL drives the default, and junk in the environment must not kill a run.
     os.environ["BLE_FLOOD_POOL"] = "512"

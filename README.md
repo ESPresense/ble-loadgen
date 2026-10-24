@@ -1,7 +1,7 @@
 # ble-loadgen
 
 BLE advertisement load generator for the ESPresense HIL bench. It advertises from a
-**static random** address ~40 times a second, rotating through a pool of 4096 of them, so
+**static random** address ~40 times a second, rotating through a fixed pool of 1024 of them, so
 every rotation costs a listening node a new fingerprint slot — a room full of phones,
 compressed. It exists to make the slow heap decline in
 [ESPresense#2309](https://github.com/ESPresense/ESPresense/issues/2309) show up in a HIL
@@ -67,7 +67,7 @@ sudo python3 ble_flood.py --index 0 --pool 512       # smaller address pool
 
 ### Address pool
 
-Addresses come from a pool (default 4096, or `$BLE_FLOOD_POOL`) and repeat once it wraps.
+Addresses are a fixed set, `f1:ad:00:00:00:00` upwards (default 1024, or `$BLE_FLOOD_POOL`), and repeat once they wrap. Every run uses the same set, so downstream rows are reused across runs rather than minted anew; the `f1ad` prefix is the same one the flood's iBeacon UUIDs carry, so consumers can filter both the same way.
 The churn a node sees is unchanged — every rotation is still a different MAC until the pool
 wraps — but anything downstream that keys off the address stops growing at `--pool` rows.
 That matters because the flood's addresses escape the bench: ESPresense Companion turns each
