@@ -33,6 +33,7 @@ import fcntl
 import glob
 import math
 import os
+import random
 import secrets
 import select
 import signal
@@ -129,7 +130,10 @@ def validate_period(period):
         raise ValueError(f"period must be a positive, finite number of seconds, got {period!r}")
 
 
-def address_pool(size):
+POOL_SEED = "ble-loadgen-pool-v1"
+
+
+def address_pool(size, seed=POOL_SEED):
     """A fixed set of static random addresses to cycle through, instead of endless new ones.
 
     Unbounded rotation is a load test for the node but a leak for everything downstream:
@@ -139,14 +143,25 @@ def address_pool(size):
     left 53k orphaned HA entities behind. A pool keeps the node's fingerprint churn identical
     -- it still sees a new MAC every rotation until the pool wraps -- while the downstream
     row count stops at len(pool).
+
+    The pool is drawn from a seeded generator, so every run cycles the *same* addresses.
+    A fresh draw per run only bounds a single run: HIL floods on every pipeline, and each
+    run left another len(pool) devices behind (12k in Home Assistant after 20 runs at
+    --pool 1024). A smaller pool is a prefix of a larger one, so changing --pool does not
+    mint new addresses either.
     """
-    pool = set()
+    rng = random.Random(seed)
+    pool = []
+    seen = set()
     while len(pool) < size:
-        pool.add(random_static_address())
-    return sorted(pool)
+        addr = random_static_address(rng)
+        if addr not in seen:
+            seen.add(addr)
+            pool.append(addr)
+    return pool
 
 
-def random_static_address():
+def random_static_address(rng=None):
     """A valid BLE static random address, in the little-endian order HCI wants.
 
     Spec: the two most significant bits must both be 1, and the remaining 46 bits must
@@ -155,7 +170,7 @@ def random_static_address():
     than discarding it as a resolvable private address it cannot resolve.
     """
     while True:
-        addr = bytearray(secrets.token_bytes(6))
+        addr = bytearray(rng.randbytes(6) if rng else secrets.token_bytes(6))
         addr[5] |= 0xC0
         rest = int.from_bytes(addr, "little") & ((1 << 46) - 1)
         if rest not in (0, (1 << 46) - 1):
@@ -585,7 +600,9 @@ def selftest():
         assert len(addr) == 6 and addr[5] & 0xC0 == 0xC0, addr.hex()
     assert [pool[n % len(pool)] for n in (0, 255, 256, 257)] == [
         pool[0], pool[255], pool[0], pool[1]], "pool must wrap"
-    assert address_pool(1) != address_pool(1), "pools must not be a fixed sequence"
+    assert address_pool(256) == pool, "every run must cycle the same addresses"
+    assert address_pool(64) == pool[:64], "a smaller pool must reuse the larger one's addresses"
+    assert address_pool(16, seed="other") != address_pool(16), "the seed picks the pool"
 
     # $BLE_FLOOD_POOL drives the default, and junk in the environment must not kill a run.
     os.environ["BLE_FLOOD_POOL"] = "512"
