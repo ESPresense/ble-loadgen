@@ -257,6 +257,40 @@ def adv_parameters():
     )
 
 
+def _usb_snapshot(root="/sys/bus/usb/devices"):
+    """A one-line-per-device summary of the host's USB bus, for the ENODEV hint.
+
+    hci{index} missing has two very different causes: the dongle fell off the bus entirely
+    (power, cable, a flaky hub -- rack/ops work) or it is still enumerated and only the
+    kernel's btusb binding is gone (a driver problem). Nothing on the bench's actual console
+    is reachable from this container, so this is the only evidence that distinguishes them
+    that a CI log can carry on its own.
+    """
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as exc:
+        return f"{root} unreadable ({exc.strerror})"
+    if not names:
+        return f"{root}: no USB devices at all"
+
+    def read(dev, attr):
+        try:
+            with open(os.path.join(dev, attr)) as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+
+    lines = []
+    for name in names:
+        dev = os.path.join(root, name)
+        vendor, product = read(dev, "idVendor"), read(dev, "idProduct")
+        if vendor is None and product is None:
+            continue  # an interface entry (e.g. "1-7:1.0"), not a device
+        label = read(dev, "product")
+        lines.append(f"{name}={vendor}:{product}" + (f" ({label})" if label else ""))
+    return f"{root}: " + (", ".join(lines) if lines else "no top-level devices")
+
+
 def _bind_hint(index, down_err, bind_err):
     """What actually went wrong, given how HCIDEVDOWN and bind() each failed.
 
@@ -272,7 +306,8 @@ def _bind_hint(index, down_err, bind_err):
                 f"container with --privileged / --cap-add NET_ADMIN.")
     if down_err == errno_mod.ENODEV or bind_err == errno_mod.ENODEV:
         return (f"{what}. No hci{index}: check `ls /sys/class/bluetooth` on the host, and that "
-                f"the container has --network host (raw HCI only works in the host netns).")
+                f"the container has --network host (raw HCI only works in the host netns). "
+                f"{_usb_snapshot()}")
     if bind_err == errno_mod.EBUSY:
         return (f"{what} after {BIND_TIMEOUT:.0f}s of retries. Something keeps hci{index} up: "
                 f"bluetoothd (systemctl mask --now bluetooth), or a leftover ble_flood.py from "
@@ -722,6 +757,7 @@ def selftest():
     assert "CAP_NET_ADMIN" in _bind_hint(0, None, errno_mod.EPERM)
     nodev = _bind_hint(0, errno_mod.ENODEV, errno_mod.EBUSY)
     assert "network host" in nodev and "sys/class/bluetooth" in nodev, nodev
+    assert "/sys/bus/usb/devices" in nodev, nodev  # the USB snapshot rides along
     assert "network host" in _bind_hint(0, None, errno_mod.ENODEV)
     busy = _bind_hint(0, None, errno_mod.EBUSY)
     assert "bluetoothd" in busy and "ble_flood.py" in busy, busy
@@ -814,6 +850,25 @@ def selftest():
             raise AssertionError("a non-USB adapter must say why it cannot be re-plugged")
         except HciError as exc:
             assert "not a USB device" in str(exc), exc
+
+    # ENODEV means hci{index} is gone, but that is two very different faults: the dongle fell
+    # off the bus (nothing to show for it below) or it is still there and only btusb's binding
+    # is gone. Nothing on the bench's console is reachable from here, so the snapshot in the
+    # ENODEV hint is the only way a CI log alone can tell those apart later.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        assert "no USB devices at all" in _usb_snapshot(tmpdir)
+        hub = os.path.join(tmpdir, "usb1")
+        os.makedirs(hub)
+        for name, value in (("idVendor", "1d6b\n"), ("idProduct", "0002\n"), ("product", "hub\n")):
+            with open(os.path.join(hub, name), "w") as fh:
+                fh.write(value)
+        iface = os.path.join(tmpdir, "1-7:1.0")  # an interface entry, no idVendor/idProduct
+        os.makedirs(iface)
+        snap = _usb_snapshot(tmpdir)
+        assert "usb1=1d6b:0002 (hub)" in snap, snap
+        assert "1-7:1.0" not in snap, snap
+        missing = os.path.join(tmpdir, "does-not-exist")
+        assert "unreadable" in _usb_snapshot(missing), _usb_snapshot(missing)
 
     # The rfkill label goes in the one message a human reads when the controller is silent, and
     # an inverted one sent a HIL debugging session after a block that was not there. Pin the
